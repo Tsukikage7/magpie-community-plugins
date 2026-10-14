@@ -2,7 +2,7 @@
 
 [OpenCode](https://opencode.ai) provider plugins for coding-plan
 subscriptions, and [gateway middleware](#gateway-middleware),
-[routing strategies](#routing-strategies), [tools for every
+[gateway hooks](#gateway-hooks), [routing strategies](#routing-strategies), [tools for every
 agent](#tools-for-every-agent), [pages](#pages) and [agents](#agents) for
 magpie, maintained by the community. To make one, see
 [Write your own](#write-your-own). Each package signs in to one
@@ -114,6 +114,37 @@ A page package is a folder under `packages/<name>/` with:
 - **`package.json`**: name `@magpie-community/page-<name>`, no `main`, and `"magpie": {"page": {"title", "file", "icon"}, "permissions": [...], "options": {…}}` ([the reference](https://usemagpie.ai/docs/plugins#pages)). `permissions` lists the reads the page makes, and magpie refuses any other. Declare only what it reads.
 - **the page**: HTML, CSS and scripts in files. It runs in a sandboxed frame with no network (`connect-src 'none'`) and no inline scripts. It talks to magpie only through `_magpie/bridge.js`: `magpie.ready`, `magpie.read(name, params)`, `magpie.options.get/set` (at most once a second), and `magpie.theme` with `onTheme`, whose `--magpie-*` variables it styles itself by.
 - a test that the page's scripts read only what `permissions` declares and reach no network, and of what it draws from a read.
+
+## Gateway hooks
+
+Like middleware, these run on the requests agents send, but in magpie's Bun host rather than on moejs, so one can wait on a service, keep state and import Node's built-ins. They need magpie with gateway hooks (`magpie.gateway`), which isn't released yet, so they aren't in `registry.json`.
+
+| Package | What it does |
+|---|---|
+| [powercontext](packages/powercontext) | [PowerContext](https://github.com/oceanbase/powercontext) recall and completed-conversation capture; no client MCP or skill required |
+
+Use the same plugin management commands as middleware. For the unreleased
+PowerContext package, install from a local checkout:
+
+```sh
+magpie plugin add "/absolute/path/to/packages/powercontext"
+```
+
+Installed plugins use **Plugins › Installed › Options** and the normal on/off
+switch. Deploy PowerContext yourself using its
+[official installation walkthrough](https://powercontext.oceanbase.io/en/docs/get-started/quickstart/),
+then configure the Server URL, authorization environment variable and Scope in
+plugin options. The package calls an existing Server; it does not provision
+services or manage processes. See the [plugin README](packages/powercontext).
+Adoption depends on the async hooks proposed in
+[yetone/magpie#2118](https://github.com/yetone/magpie/issues/2118) and a compatible
+Magpie version; no released host version is claimed yet.
+
+A gateway hook package is a folder under `packages/<name>/` with:
+
+- **`package.json`**: name `@magpie-community/gateway-<name>`, `"magpie": {"gateway": "./<name>.gateway.mjs", "options": {…}}`, no `main`.
+- **`<name>.gateway.mjs`**: exports async `onRequest(body, ctx)` to add context. Optional `onResponse(reply, ctx)` observes a completed reply through a bounded, best-effort notification. The hooks share request-local `ctx.state`. Client tool declarations and execution loops remain client-owned.
+- tests that call the hooks the way the gateway does, with any service they talk to faked.
 
 ## Agents
 
