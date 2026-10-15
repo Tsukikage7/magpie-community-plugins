@@ -7,7 +7,7 @@
 // as a Source, which the server turns into Memory on its own.
 //
 //   {"serverUrl": "http://127.0.0.1:8000", "authorizationEnv": "POWERCONTEXT_AUTHORIZATION",
-//    "scopeId": "", "maxBytes": 8000, "capture": false, "captureRemote": false, "allowInsecureHttp": false}
+//    "scopeId": "", "maxBytes": 8000, "capture": false, "captureRemote": false, "recallRemote": false, "allowInsecureHttp": false}
 //
 // A turn keeps the block it was given for the rest of the conversation, so
 // what the agent sends stays the same from one request to the next and the
@@ -84,11 +84,18 @@ export async function onRequest(body, ctx) {
 }
 async function run(body, ctx) {
     const o = options(ctx.options);
-    if (!o) {
+    if (!o || (ctx.origin !== "local" && !o.recallRemote && !(o.capture && o.captureRemote))) {
         ctx.report?.("skipped");
         return;
     }
     const original = structuredClone(body);
+    if (ctx.origin !== "local" && !o.recallRemote) {
+        // Explicit capture permission does not grant access to recalled memory.
+        const send = client(o);
+        await bind(original, ctx, o, await scope(send, o, ctx), send);
+        ctx.report?.("skipped");
+        return;
+    }
     const all = turns(body, ctx.protocol);
     const turn = target(all, ctx.query ?? "");
     if (!turn) {
@@ -106,7 +113,7 @@ async function run(body, ctx) {
         return;
     }
     const key = sha256(o.server.href, o.authorization ?? "", o.scopeId ?? "");
-    const conversation = lru(sticky, sha256(key, ctx.session ?? "", ctx.cwd ?? ""), () => new Map(), maxSessions);
+    const conversation = lru(sticky, sha256(key, ctx.origin ?? "unknown", ctx.protocol, ctx.session ?? "", ctx.cwd ?? ""), () => new Map(), maxSessions);
     const turnKey = (t) => sha256(String(t.index), t.text);
     // earlier turns get back the block each was sent with
     let changed = false;
@@ -165,7 +172,7 @@ function options(raw = {}, env = process.env) {
             throw new Failure("invalid");
         return v;
     };
-    const serverUrl = text(raw.serverUrl) ?? text(env.POWERCONTEXT_SERVER_URL);
+    const serverUrl = text(raw.serverUrl);
     if (!serverUrl)
         return;
     let server;
@@ -185,7 +192,7 @@ function options(raw = {}, env = process.env) {
     const maxBytes = raw.maxBytes ?? 8000;
     if (!Number.isInteger(maxBytes) || maxBytes < 512 || maxBytes > 32768)
         throw new Failure("invalid");
-    for (const name of ["capture", "captureRemote"])
+    for (const name of ["capture", "captureRemote", "recallRemote"])
         if (raw[name] !== undefined && typeof raw[name] !== "boolean")
             throw new Failure("invalid");
     const idleCaptureMs = raw.idleCaptureMs ?? 10 * 60_000;
@@ -195,9 +202,10 @@ function options(raw = {}, env = process.env) {
     return {
         server, maxBytes,
         authorization: text(raw.authorization) ?? text(env[authorizationEnv]),
-        scopeId: text(raw.scopeId) ?? text(env.POWERCONTEXT_SCOPE_ID),
+        scopeId: text(raw.scopeId),
         capture: raw.capture ?? false,
         captureRemote: raw.captureRemote ?? false,
+        recallRemote: raw.recallRemote ?? false,
         idleCaptureMs,
     };
 }
@@ -456,9 +464,9 @@ export function onResponse(reply, ctx) {
     const bytes = utf8(content);
     const metadata = { origin: "magpie", event: "conversation_completed", protocol: ctx.protocol };
     if (ctx.session)
-        metadata.session_id = ctx.session;
+        metadata.session_id = sha256(ctx.session);
     if (ctx.cwd)
-        metadata.cwd = ctx.cwd;
+        metadata.cwd = sha256(resolve(ctx.cwd));
     const old = pending.get(state.identity);
     if (old) {
         clearTimeout(old.timer);
@@ -498,18 +506,14 @@ function persist(p) {
         for (const [index, content] of parts.entries()) {
             const metadata = { ...p.metadata, conversation_id, ...(parts.length === 1 ? {} : { part: index + 1, parts: parts.length }) };
             const source_id = `magpie-conversation:${sha256(p.scopeId, p.content, JSON.stringify(metadata))}`;
-            const attempt = async (remaining) => {
-                try {
-                    await p.send("POST", "v1/sources/content", { scope_id: p.scopeId, source_id, content, metadata }, AbortSignal.timeout(10_000));
-                }
-                catch (error) {
-                    if (!remaining || error instanceof Failure && ["unauthorized", "invalid"].includes(error.code))
-                        return;
-                    await new Promise((resolve) => { const timer = setTimeout(resolve, 1000); timer.unref?.(); });
-                    await attempt(remaining - 1);
-                }
-            };
-            await attempt(2);
+            try {
+                await p.send("POST", "v1/sources/content", { scope_id: p.scopeId, source_id, content, metadata }, AbortSignal.timeout(10_000));
+            }
+            catch {
+                // A timeout can follow a committed write. Do not retry an
+                // uncertain receipt or continue with a partial fragment set.
+                return;
+            }
         }
     })();
 }

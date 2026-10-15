@@ -135,7 +135,7 @@ switch. Deploy PowerContext yourself using its
 [official installation walkthrough](https://powercontext.oceanbase.io/en/docs/get-started/quickstart/),
 then explicitly configure the Server URL, authorization environment variable and
 Scope in plugin options. No Server URL is assumed and capture defaults to off;
-remote/shared-key capture needs a separate opt-in. The package calls an existing
+remote/shared-key recall and capture each need a separate opt-in. The package calls an existing
 Server; it does not provision services or manage processes. See the
 [plugin README](packages/powercontext).
 Adoption depends on the async hooks proposed in

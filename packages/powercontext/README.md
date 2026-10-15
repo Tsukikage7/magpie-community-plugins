@@ -1,9 +1,12 @@
 # PowerContext gateway plugin
 
-Automatic context recall for clients behind Magpie. Optional capture sends full
-user and assistant turns, including client tool calls and results, to your
-configured PowerContext Server. Capture is off by default; nothing is sent until
-you configure a Server URL. Remote/shared-key capture requires a separate opt-in.
+Recall sends the latest user turn to the PowerContext Server configured explicitly
+in plugin Options, even when capture is off, and adds returned Memory/Profile
+context to the model request. Optional capture exports full user and assistant
+turns, including client tool calls and results, to that same Server. Capture is
+off by default. No configured URL means no service requests. Recall and capture
+allow only host-classified local requests by default; other callers require
+separate `recallRemote` and `captureRemote` opt-ins.
 
 Requires a Magpie build supporting the proposed async gateway hooks in
 [yetone/magpie#2118](https://github.com/yetone/magpie/issues/2118). This is not
@@ -18,13 +21,15 @@ sequenceDiagram
     participant Model
     Client->>Magpie: Request
     Magpie->>Plugin: onRequest with host-derived origin
-    Plugin->>PC: Resolve Scope, prepare context, latest Handoff
-    PC-->>Plugin: Untrusted reference text
-    Plugin-->>Magpie: Context-enriched request
+    opt Server configured and recall origin allowed
+        Plugin->>PC: Resolve Scope, latest user turn, latest Handoff
+        PC-->>Plugin: Untrusted reference text
+        Plugin-->>Magpie: Context-enriched request
+    end
     Magpie->>Model: One inference request
     Model-->>Client: Live response through Magpie
     Magpie--)Plugin: Completed response notification
-    opt Capture enabled and origin allowed
+    opt Server configured, capture enabled and origin allowed
         Plugin--)PC: Complete conversation Source
         PC->>PC: Background Memory extraction
     end
@@ -61,13 +66,19 @@ or skill.
 ## Behavior and options
 
 - `serverUrl`: standalone Server base URL, **no default**. Set it explicitly
-  in Options (or `POWERCONTEXT_SERVER_URL` in the host environment); without it,
+  in Options; without it,
   neither recall nor capture sends anything.
 - `authorizationEnv`: bearer authorization variable (default `POWERCONTEXT_AUTHORIZATION`).
   `authorization` is also accepted in protected local plugin options.
 - `scopeId`: explicit Scope. If absent, resolve an existing Magpie session or
   workspace binding. A missing binding fails open; the plugin does not create
   scopes or grant a model permission to change them.
+- `recallRemote`: default **false**. Recall and sticky context replay allow only
+  host-classified `local` requests. Remote, named/shared Gateway Key and missing
+  or unknown origins make no service requests by default. Enable this option
+  only if these callers may send their prompts to the configured Server and
+  receive its Scope's Memory/Profile. It does not enable capture. Recall caches
+  are isolated by origin and protocol, including when remote recall is allowed.
 - `maxBytes`: recall budget, default 8000 bytes.
 - `gatewayTimeoutMs`: Magpie's bounded async hook deadline, default 5000 ms.
 - `capture`: enable completed-conversation capture, default **false**. Recall
@@ -76,11 +87,21 @@ or skill.
   `local` requests are captured. Remote, named/shared Gateway Key (even on
   loopback), and missing/unknown origins are skipped. Set `"captureRemote": true`
   only if you intend to capture these other callers too and have their consent.
-  This option alone does not enable capture. Forwarded/proxied requests are
+  This option alone does not enable capture or recall. With capture explicitly
+  enabled, it may send Scope-resolution requests and conversation Sources even
+  when remote recall is disabled. Forwarded/proxied requests are
   nonlocal even when Magpie trusts the proxy for authentication.
 - `idleCaptureMs`: default ten minutes; range 1000–86400000 ms. A later user
   turn confirming a retained answer can trigger capture earlier.
 - `allowInsecureHttp`: explicit opt-in for non-loopback HTTP; prefer HTTPS.
+
+`POWERCONTEXT_SERVER_URL` and `POWERCONTEXT_SCOPE_ID` are not read; stale
+settings from another integration cannot enable this plugin or override its
+Scope. The authorization environment variable remains supported for credentials.
+Scope resolution sends the session ID as a binding key and a SHA-256 digest of
+the normalized workspace path. Source metadata uses SHA-256 digests for both
+session ID and workspace path; it does not contain their raw values. Conversation
+content is otherwise complete and can itself contain paths or identifiers.
 
 Chat Completions, Responses, Anthropic Messages and Gemini requests retain their
 protocol. Context is escaped and enclosed as untrusted reference text in the
@@ -99,7 +120,9 @@ be a complete transcript. Failed, truncated and incomplete replies are skipped.
 The gateway completion notification and plugin's idle capture timer are
 best-effort. Process shutdown can lose pending capture; this is not durable or
 exactly-once delivery. Source identifiers/digests provide stable content
-identity, but uncertain writes must not be blindly retried.
+identity, but do not establish an exactly-once guarantee. Each Source fragment
+is attempted once. An uncertain or failed write is not automatically retried;
+remaining fragments stop after a failure, and delivery may be lost or partial.
 
 PowerContext's configured background inference turns Sources into Memory. It
 needs its own generation model and credentials; the plugin does not reuse the

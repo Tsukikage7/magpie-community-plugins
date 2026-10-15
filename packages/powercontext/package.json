@@ -28,7 +28,8 @@
       "gatewayTimeoutMs": 5000,
       "maxBytes": 8000,
       "capture": false,
-      "captureRemote": false
+      "captureRemote": false,
+      "recallRemote": false
     }
   },
   "scripts": {

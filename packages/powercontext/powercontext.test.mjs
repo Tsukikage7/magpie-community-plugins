@@ -34,7 +34,7 @@ function mock(context = "Quartz codename: QUARTZ-8413", extra = {}) {
 const settle = () => new Promise((r) => setTimeout(r, 20))
 const of = (path) => calls.filter((c) => c.path === path)
 const ctx = (protocol, extra = {}) => ({
-  protocol, query: "Quartz codename?", cwd: "/tmp/quartz", session: "session-a", signal: new AbortController().signal,
+  protocol, origin: "local", query: "Quartz codename?", cwd: "/tmp/quartz", session: "session-a", signal: new AbortController().signal,
   ...extra,
   options: { serverUrl: "http://127.0.0.1:8000", authorization: "Bearer synthetic", ...extra.options },
 })
@@ -154,7 +154,7 @@ test("completed conversations are confirmed by the next turn and stored with sta
   expect(src.body.content).not.toContain("powercontext-reference")
   expect(src.body.content).not.toContain("Existing instruction")
   expect(src.body.source_id).toMatch(/^magpie-conversation:[0-9a-f]{64}$/)
-  expect(src.body.metadata).toMatchObject({ origin: "magpie", event: "conversation_completed", session_id: "session-a", protocol: "chat", cwd: "/tmp/quartz" })
+  expect(src.body.metadata).toMatchObject({ origin: "magpie", event: "conversation_completed", session_id: createHash("sha256").update("session-a").digest("hex"), protocol: "chat", cwd: createHash("sha256").update("/tmp/quartz").digest("hex") })
   expect(src.body.metadata.conversation_id).toMatch(/^[0-9a-f]{64}$/)
   reset(); calls.length = 0
   const replay = lifecycle()
@@ -452,7 +452,7 @@ test("a server under a path, with a Scope set, is the only one asked", async () 
 test("options it can't use are invalid, before anything is sent", async () => {
   mock()
   for (const bad of [{ serverUrl: "http://remote.example" }, { serverUrl: "https://u:p@context.example" }, { serverUrl: "https://context.example/?t=1" },
-    { maxBytes: 100 }, { maxBytes: "8000" }, { capture: "yes" }, { captureRemote: "yes" }, { scopeId: 7 }]) {
+    { maxBytes: 100 }, { maxBytes: "8000" }, { capture: "yes" }, { captureRemote: "yes" }, { recallRemote: "yes" }, { scopeId: 7 }]) {
     const [reports, c] = reporting("chat", { options: bad })
     await expect(onRequest(structuredClone(chat), c)).rejects.toThrow("PowerContext invalid")
     expect(reports).toEqual([["invalid"]])
@@ -510,7 +510,7 @@ test("capture excludes remote, gateway-key and unknown origins unless explicitly
   for (const origin of ["remote", "gateway-key", undefined, "unrecognized"]) {
     for (const captureRemote of [false, true]) {
       reset(); calls.length = 0; mock()
-      const extra = { origin, options: { captureRemote } }
+      const extra = { origin, options: { captureRemote, recallRemote: true } }
       const c = lifecycle(extra)
       expect(JSON.stringify(await onRequest(structuredClone(chat), c))).toContain("QUARTZ-8413")
       onResponse(reply, c)
@@ -543,5 +543,89 @@ test("a nonlocal request with the same session cannot flush a local capture", as
   expect(of("/v1/sources/content")).toHaveLength(0)
   await onRequest(nextTurn(), lifecycle({ query: "And its owner?" }))
   await settle()
+  expect(of("/v1/sources/content")).toHaveLength(1)
+})
+
+test("nonlocal recall needs its own opt-in before any service request or cache replay", async () => {
+  mock()
+  await onRequest(structuredClone(chat), ctx("chat"))
+  for (const origin of ["remote", "gateway-key", undefined, "unrecognized"]) {
+    calls.length = 0
+    const body = structuredClone(chat)
+    const c = ctx("chat", { origin, state: {} })
+    expect(await onRequest(body, c)).toBeUndefined()
+    expect(body).toEqual(chat)
+    expect(c.state).toEqual({})
+    expect(calls).toHaveLength(0)
+    const retained = nextTurn()
+    expect(await onRequest(retained, ctx("chat", { origin, query: "And its owner?" }))).toBeUndefined()
+    expect(retained).toEqual(nextTurn())
+    expect(calls).toHaveLength(0)
+  }
+})
+
+test("opted-in recall keeps sticky blocks isolated by origin", async () => {
+  for (const [index, origin] of ["local", "remote", "gateway-key", undefined].entries()) {
+    mock(`origin-block-${index}`)
+    const c = ctx("chat", { origin, options: { recallRemote: true } })
+    const out = await onRequest(structuredClone(chat), c)
+    expect(JSON.stringify(out)).toContain(`origin-block-${index}`)
+    for (let prior = 0; prior < index; prior++) expect(JSON.stringify(out)).not.toContain(`origin-block-${prior}`)
+    calls.length = 0
+    expect(JSON.stringify(await onRequest(structuredClone(chat), c))).toContain(`origin-block-${index}`)
+    expect(calls).toHaveLength(0)
+    const history = await onRequest(nextTurn(), ctx("chat", { origin, query: "And its owner?", options: { recallRemote: true } }))
+    expect(JSON.stringify(history.messages[1])).toContain(`origin-block-${index}`)
+    for (let prior = 0; prior < index; prior++) expect(JSON.stringify(history)).not.toContain(`origin-block-${prior}`)
+  }
+})
+
+test("remote recall and capture permissions are independent", async () => {
+  for (const origin of ["remote", "gateway-key", undefined]) {
+    for (const recallRemote of [false, true]) {
+      reset(); calls.length = 0; mock()
+      const extra = { origin, options: { recallRemote, captureRemote: true } }
+      const c = lifecycle(extra)
+      const body = structuredClone(chat)
+      const out = await onRequest(body, c)
+      expect(JSON.stringify(out ?? body).includes("QUARTZ-8413")).toBe(recallRemote)
+      expect(of("/v1/context/prepare")).toHaveLength(recallRemote ? 1 : 0)
+      expect(of("/v1/handoff/hint")).toHaveLength(recallRemote ? 1 : 0)
+      onResponse(reply, c)
+      await onRequest(nextTurn(), lifecycle({ ...extra, query: "And its owner?" }))
+      await settle()
+      expect(of("/v1/sources/content")).toHaveLength(1)
+    }
+  }
+})
+
+test("leftover service and Scope environment variables cannot enable or redirect recall", async () => {
+  mock()
+  const saved = [process.env.POWERCONTEXT_SERVER_URL, process.env.POWERCONTEXT_SCOPE_ID]
+  process.env.POWERCONTEXT_SERVER_URL = "http://127.0.0.1:9999"
+  process.env.POWERCONTEXT_SCOPE_ID = "leftover-owner-scope"
+  try {
+    expect(await onRequest(structuredClone(chat), ctx("chat", { options: { serverUrl: undefined } }))).toBeUndefined()
+    expect(calls).toHaveLength(0)
+    await onRequest(structuredClone(chat), ctx("chat"))
+    expect(of("/v1/scope-bindings/resolve")[0].body.explicit_scope_id).toBeUndefined()
+    expect(calls.every(c => c.url.startsWith("http://127.0.0.1:8000/"))).toBe(true)
+  } finally {
+    for (const [index, key] of ["POWERCONTEXT_SERVER_URL", "POWERCONTEXT_SCOPE_ID"].entries()) {
+      if (saved[index] === undefined) delete process.env[key]
+      else process.env[key] = saved[index]
+    }
+  }
+})
+
+test("an uncertain Source write is not retried", async () => {
+  mock("Quartz codename: QUARTZ-8413", {
+    "/v1/sources/content": () => { throw new Error("receipt lost after storage") },
+  })
+  const c = lifecycle()
+  await onRequest(structuredClone(chat), c)
+  onResponse(reply, c)
+  await onRequest(nextTurn(), lifecycle({ query: "And its owner?" }))
+  await new Promise(r => setTimeout(r, 2300))
   expect(of("/v1/sources/content")).toHaveLength(1)
 })
