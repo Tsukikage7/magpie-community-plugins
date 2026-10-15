@@ -56,6 +56,15 @@ magpie plugin add "/absolute/path/to/packages/powercontext"
 magpie plugin options "/absolute/path/to/packages/powercontext" '{"serverUrl":"http://127.0.0.1:8000","scopeId":"YOUR_SCOPE","authorizationEnv":"POWERCONTEXT_AUTHORIZATION","gatewayTimeoutMs":5000}'
 ~~~
 
+Once the hooks are released and this package is merged, it uses the repository's
+normal [publishing flow](../../README.md#publishing): the shared workflow packs
+it onto the `dist` branch, with a SHA-512 integrity entry, and publishes to npm
+when available. Magpie's `dist` fallback (available since 0.1.1243) removes the
+need to wait for a first npm publish; that version alone does not support this
+package's gateway hooks. The `on-npm` check reports an unpublished package as a
+notice. Keep this package out of `registry.json` until a compatible host is
+released. No separate PowerContext publishing workflow is needed.
+
 Provide POWERCONTEXT_AUTHORIZATION=Bearer <server token> in Magpie's existing
 protected environment configuration. Do not put credentials in Git or client
 model prompts. For remote Servers, use HTTPS. Installation and options use the
