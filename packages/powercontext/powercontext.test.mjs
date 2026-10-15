@@ -136,7 +136,7 @@ test("a new conversation gets the latest Handoff's hint, once; no Handoff is no 
 const reply = { choices: [{ message: { role: "assistant", content: "QUARTZ-8413" }, finish_reason: "stop" }] }
 const nextTurn = (answer = "QUARTZ-8413") => ({ messages: [...structuredClone(chat.messages),
   { role: "assistant", content: answer }, { role: "user", content: "And its owner?" }] })
-const lifecycle = (extra = {}) => ctx("chat", { state: {}, ...extra, options: { ...extra.options } })
+const lifecycle = (extra = {}) => ctx("chat", { state: {}, origin: "local", ...extra, options: { capture: true, ...extra.options } })
 
 test("completed conversations are confirmed by the next turn and stored with stable ids", async () => {
   mock()
@@ -452,7 +452,7 @@ test("a server under a path, with a Scope set, is the only one asked", async () 
 test("options it can't use are invalid, before anything is sent", async () => {
   mock()
   for (const bad of [{ serverUrl: "http://remote.example" }, { serverUrl: "https://u:p@context.example" }, { serverUrl: "https://context.example/?t=1" },
-    { maxBytes: 100 }, { maxBytes: "8000" }, { capture: "yes" }, { scopeId: 7 }]) {
+    { maxBytes: 100 }, { maxBytes: "8000" }, { capture: "yes" }, { captureRemote: "yes" }, { scopeId: 7 }]) {
     const [reports, c] = reporting("chat", { options: bad })
     await expect(onRequest(structuredClone(chat), c)).rejects.toThrow("PowerContext invalid")
     expect(reports).toEqual([["invalid"]])
@@ -474,4 +474,74 @@ test("the reported outcome never carries the server's text", async () => {
     await expect(onRequest(structuredClone(chat), c)).rejects.toThrow(`PowerContext ${code}`)
     expect(reports).toEqual([[code]])
   }
+})
+
+test("an unconfigured server sends nothing, even with capture enabled", async () => {
+  mock()
+  const saved = process.env.POWERCONTEXT_SERVER_URL
+  delete process.env.POWERCONTEXT_SERVER_URL
+  try {
+    for (const serverUrl of [undefined, ""]) {
+      const c = lifecycle({ options: { serverUrl } })
+      const body = structuredClone(chat)
+      expect(await onRequest(body, c)).toBeUndefined()
+      onResponse(reply, c)
+      expect(body).toEqual(chat)
+      expect(c.state).toEqual({})
+    }
+    expect(calls).toHaveLength(0)
+  } finally {
+    if (saved === undefined) delete process.env.POWERCONTEXT_SERVER_URL
+    else process.env.POWERCONTEXT_SERVER_URL = saved
+  }
+})
+
+test("capture is a separate opt-in; default options still recall", async () => {
+  mock()
+  const c = ctx("chat", { origin: "local", state: {} })
+  expect(JSON.stringify(await onRequest(structuredClone(chat), c))).toContain("QUARTZ-8413")
+  onResponse(reply, c)
+  await onRequest(nextTurn(), ctx("chat", { origin: "local", state: {}, query: "And its owner?" }))
+  expect(c.state).toEqual({})
+  expect(of("/v1/sources/content")).toHaveLength(0)
+})
+
+test("capture excludes remote, gateway-key and unknown origins unless explicitly permitted", async () => {
+  for (const origin of ["remote", "gateway-key", undefined, "unrecognized"]) {
+    for (const captureRemote of [false, true]) {
+      reset(); calls.length = 0; mock()
+      const extra = { origin, options: { captureRemote } }
+      const c = lifecycle(extra)
+      expect(JSON.stringify(await onRequest(structuredClone(chat), c))).toContain("QUARTZ-8413")
+      onResponse(reply, c)
+      await onRequest(nextTurn(), lifecycle({ ...extra, query: "And its owner?" }))
+      await settle()
+      expect(of("/v1/sources/content")).toHaveLength(captureRemote ? 1 : 0)
+      if (!captureRemote) expect(c.state).toEqual({})
+    }
+  }
+})
+
+test("remote capture permission alone never enables capture", async () => {
+  mock()
+  const c = ctx("chat", { origin: "remote", state: {}, options: { captureRemote: true } })
+  await onRequest(structuredClone(chat), c)
+  onResponse(reply, c)
+  expect(c.state).toEqual({})
+  expect(of("/v1/sources/content")).toHaveLength(0)
+})
+
+test("a nonlocal request with the same session cannot flush a local capture", async () => {
+  mock()
+  const c = lifecycle()
+  await onRequest(structuredClone(chat), c)
+  onResponse(reply, c)
+  for (const origin of ["remote", "gateway-key", undefined]) {
+    await onRequest(nextTurn(), lifecycle({ origin, query: "And its owner?" }))
+  }
+  await settle()
+  expect(of("/v1/sources/content")).toHaveLength(0)
+  await onRequest(nextTurn(), lifecycle({ query: "And its owner?" }))
+  await settle()
+  expect(of("/v1/sources/content")).toHaveLength(1)
 })

@@ -121,7 +121,7 @@ Like middleware, these run on the requests agents send, but in magpie's Bun host
 
 | Package | What it does |
 |---|---|
-| [powercontext](packages/powercontext) | [PowerContext](https://github.com/oceanbase/powercontext) recall and completed-conversation capture; no client MCP or skill required |
+| [powercontext](packages/powercontext) | [PowerContext](https://github.com/oceanbase/powercontext) recall and opt-in completed-conversation capture; no client MCP or skill required |
 
 Use the same plugin management commands as middleware. For the unreleased
 PowerContext package, install from a local checkout:
@@ -133,9 +133,11 @@ magpie plugin add "/absolute/path/to/packages/powercontext"
 Installed plugins use **Plugins › Installed › Options** and the normal on/off
 switch. Deploy PowerContext yourself using its
 [official installation walkthrough](https://powercontext.oceanbase.io/en/docs/get-started/quickstart/),
-then configure the Server URL, authorization environment variable and Scope in
-plugin options. The package calls an existing Server; it does not provision
-services or manage processes. See the [plugin README](packages/powercontext).
+then explicitly configure the Server URL, authorization environment variable and
+Scope in plugin options. No Server URL is assumed and capture defaults to off;
+remote/shared-key capture needs a separate opt-in. The package calls an existing
+Server; it does not provision services or manage processes. See the
+[plugin README](packages/powercontext).
 Adoption depends on the async hooks proposed in
 [yetone/magpie#2118](https://github.com/yetone/magpie/issues/2118) and a compatible
 Magpie version; no released host version is claimed yet.

@@ -7,7 +7,7 @@
 // as a Source, which the server turns into Memory on its own.
 //
 //   {"serverUrl": "http://127.0.0.1:8000", "authorizationEnv": "POWERCONTEXT_AUTHORIZATION",
-//    "scopeId": "", "maxBytes": 8000, "capture": true, "allowInsecureHttp": false}
+//    "scopeId": "", "maxBytes": 8000, "capture": false, "captureRemote": false, "allowInsecureHttp": false}
 //
 // A turn keeps the block it was given for the rest of the conversation, so
 // what the agent sends stays the same from one request to the next and the
@@ -84,6 +84,10 @@ export async function onRequest(body, ctx) {
 }
 async function run(body, ctx) {
     const o = options(ctx.options);
+    if (!o) {
+        ctx.report?.("skipped");
+        return;
+    }
     const original = structuredClone(body);
     const all = turns(body, ctx.protocol);
     const turn = target(all, ctx.query ?? "");
@@ -161,9 +165,12 @@ function options(raw = {}, env = process.env) {
             throw new Failure("invalid");
         return v;
     };
+    const serverUrl = text(raw.serverUrl) ?? text(env.POWERCONTEXT_SERVER_URL);
+    if (!serverUrl)
+        return;
     let server;
     try {
-        server = new URL(text(raw.serverUrl) ?? env.POWERCONTEXT_SERVER_URL ?? "http://127.0.0.1:8000");
+        server = new URL(serverUrl);
     }
     catch {
         throw new Failure("invalid");
@@ -178,8 +185,9 @@ function options(raw = {}, env = process.env) {
     const maxBytes = raw.maxBytes ?? 8000;
     if (!Number.isInteger(maxBytes) || maxBytes < 512 || maxBytes > 32768)
         throw new Failure("invalid");
-    if (raw.capture !== undefined && typeof raw.capture !== "boolean")
-        throw new Failure("invalid");
+    for (const name of ["capture", "captureRemote"])
+        if (raw[name] !== undefined && typeof raw[name] !== "boolean")
+            throw new Failure("invalid");
     const idleCaptureMs = raw.idleCaptureMs ?? 10 * 60_000;
     if (!Number.isInteger(idleCaptureMs) || idleCaptureMs < 1000 || idleCaptureMs > 86_400_000)
         throw new Failure("invalid");
@@ -188,7 +196,8 @@ function options(raw = {}, env = process.env) {
         server, maxBytes,
         authorization: text(raw.authorization) ?? text(env[authorizationEnv]),
         scopeId: text(raw.scopeId) ?? text(env.POWERCONTEXT_SCOPE_ID),
-        capture: raw.capture ?? true,
+        capture: raw.capture ?? false,
+        captureRemote: raw.captureRemote ?? false,
         idleCaptureMs,
     };
 }
@@ -375,9 +384,9 @@ function prepared(value, maxBytes) {
 }
 // State belongs to one gateway request and its completion notification.
 async function bind(body, ctx, o, scopeId, send) {
-    if (!ctx.state)
-        return; // Older request-only hosts can still recall.
-    const cacheIdentity = sha256(o.server.href, o.authorization ?? "", scopeId, ctx.session ?? "", ctx.cwd ?? "", ctx.protocol);
+    if (!ctx.state || !o.capture || (ctx.origin !== "local" && !o.captureRemote))
+        return; // Recall needs no capture permission; unknown origins are excluded.
+    const cacheIdentity = sha256(o.server.href, o.authorization ?? "", scopeId, ctx.session ?? "", ctx.cwd ?? "", ctx.protocol, ctx.origin ?? "unknown");
     let responsePrefix;
     let missingResponseHistory = false;
     if (ctx.protocol === "responses" && typeof body.previous_response_id === "string") {

@@ -1,7 +1,11 @@
 # PowerContext gateway plugin
 
-Automatic context recall and completed-conversation capture for clients behind
-Magpie. Requires a Magpie build supporting the proposed async gateway hooks in
+Automatic context recall for clients behind Magpie. Optional capture sends full
+user and assistant turns, including client tool calls and results, to your
+configured PowerContext Server. Capture is off by default; nothing is sent until
+you configure a Server URL. Remote/shared-key capture requires a separate opt-in.
+
+Requires a Magpie build supporting the proposed async gateway hooks in
 [yetone/magpie#2118](https://github.com/yetone/magpie/issues/2118). This is not
 compatible with stable versions that only expose synchronous middleware.
 
@@ -13,15 +17,17 @@ sequenceDiagram
     participant PC as Standalone PowerContext
     participant Model
     Client->>Magpie: Request
-    Magpie->>Plugin: onRequest
+    Magpie->>Plugin: onRequest with host-derived origin
     Plugin->>PC: Resolve Scope, prepare context, latest Handoff
     PC-->>Plugin: Untrusted reference text
     Plugin-->>Magpie: Context-enriched request
     Magpie->>Model: One inference request
     Model-->>Client: Live response through Magpie
     Magpie--)Plugin: Completed response notification
-    Plugin--)PC: Complete conversation Source
-    PC->>PC: Background Memory extraction
+    opt Capture enabled and origin allowed
+        Plugin--)PC: Complete conversation Source
+        PC->>PC: Background Memory extraction
+    end
     Note over PC: Future sessions can recall generated Memory
 ```
 
@@ -49,12 +55,14 @@ Provide POWERCONTEXT_AUTHORIZATION=Bearer <server token> in Magpie's existing
 protected environment configuration. Do not put credentials in Git or client
 model prompts. For remote Servers, use HTTPS. Installation and options use the
 same Magpie plugin controls as other packages; installing this plugin does not
-start the independent Server. Automatic recall/capture requires no client MCP
+start the independent Server. Recall and opt-in capture require no client MCP
 or skill.
 
 ## Behavior and options
 
-- `serverUrl`: standalone Server base URL (default `http://127.0.0.1:8000`).
+- `serverUrl`: standalone Server base URL, **no default**. Set it explicitly
+  in Options (or `POWERCONTEXT_SERVER_URL` in the host environment); without it,
+  neither recall nor capture sends anything.
 - `authorizationEnv`: bearer authorization variable (default `POWERCONTEXT_AUTHORIZATION`).
   `authorization` is also accepted in protected local plugin options.
 - `scopeId`: explicit Scope. If absent, resolve an existing Magpie session or
@@ -62,7 +70,14 @@ or skill.
   scopes or grant a model permission to change them.
 - `maxBytes`: recall budget, default 8000 bytes.
 - `gatewayTimeoutMs`: Magpie's bounded async hook deadline, default 5000 ms.
-- `capture`: enable completed-conversation capture, default true.
+- `capture`: enable completed-conversation capture, default **false**. Recall
+  works independently. Set `"capture": true` explicitly in Options to opt in.
+- `captureRemote`: default **false**. With capture enabled, only host-classified
+  `local` requests are captured. Remote, named/shared Gateway Key (even on
+  loopback), and missing/unknown origins are skipped. Set `"captureRemote": true`
+  only if you intend to capture these other callers too and have their consent.
+  This option alone does not enable capture. Forwarded/proxied requests are
+  nonlocal even when Magpie trusts the proxy for authentication.
 - `idleCaptureMs`: default ten minutes; range 1000–86400000 ms. A later user
   turn confirming a retained answer can trigger capture earlier.
 - `allowInsecureHttp`: explicit opt-in for non-loopback HTTP; prefer HTTPS.
