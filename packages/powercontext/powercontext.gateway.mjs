@@ -45,7 +45,7 @@ const foreign = [
 ];
 // A prompt that looks like it holds a credential is not saved at all:
 // masking part of it could still leave the rest on the server.
-const secret = /(?:\b(?:api[_-]?key|access[_-]?token|token|authorization|password|passwd|secret|private[_-]?key|client[_-]?secret)["']?\s*[:=]\s*\S+|\bbearer\s+[A-Za-z0-9._~+/=-]{8,}|\bsk-[A-Za-z0-9_-]{8,}|\bgh[pousr]_[A-Za-z0-9]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}|\bxox[abprs]-[A-Za-z0-9-]{10,}|\bAKIA[0-9A-Z]{16}\b|-----BEGIN [^-]*PRIVATE KEY-----)/iu;
+const secret = /(?:(?:^|[^A-Za-z0-9])(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|access[_-]?key|access[_-]?token|token|authorization|password|passwd|secret|private[_-]?key|client[_-]?secret)["']?\s*[:=]\s*\S+|\bbearer\s+[A-Za-z0-9._~+/=-]{8,}|\bsk-[A-Za-z0-9_-]{8,}|\bgh[pousr]_[A-Za-z0-9]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}|\bxox[abprs]-[A-Za-z0-9-]{10,}|\bAKIA[0-9A-Z]{16}\b|-----BEGIN [^-]*PRIVATE KEY-----)/iu;
 // The only codes magpie's Plugins page shows: an error's own text may hold
 // a token, a prompt or recalled material.
 class Failure extends Error {
@@ -60,6 +60,8 @@ class Failure extends Error {
 // magpie's Bun host is long-lived: these last till the plugin is reloaded.
 const sticky = new Map();
 const unsectioned = new Map();
+const unavailable = new Map();
+const recallCacheBytes = 8 << 20;
 const maxSessions = 256;
 const maxTurns = 128;
 const captureCacheBytes = 32 << 20;
@@ -68,6 +70,7 @@ const responses = new Map();
 export function reset() {
     sticky.clear();
     unsectioned.clear();
+    unavailable.clear();
     responses.clear();
     for (const p of pending.values())
         clearTimeout(p.timer);
@@ -88,6 +91,11 @@ async function run(body, ctx) {
         ctx.report?.("skipped");
         return;
     }
+    const key = serviceKey(o);
+    if ((unavailable.get(key) ?? 0) > Date.now()) {
+        ctx.report?.("unavailable");
+        return;
+    }
     const original = structuredClone(body);
     if (ctx.origin !== "local" && !o.recallRemote) {
         // Explicit capture permission does not grant access to recalled memory.
@@ -101,7 +109,7 @@ async function run(body, ctx) {
     if (!turn) {
         // Responses clients can continue a known reply with only tool outputs.
         // Bind the response lifecycle without recalling or changing wire history.
-        if (ctx.state && ctx.protocol === "responses" && typeof body.previous_response_id === "string") {
+        if (o.capture && ctx.state && ctx.protocol === "responses" && typeof body.previous_response_id === "string") {
             const send = client(o);
             await bind(original, ctx, o, await scope(send, o, ctx), send);
         }
@@ -112,7 +120,6 @@ async function run(body, ctx) {
         ctx.report?.("skipped");
         return;
     }
-    const key = sha256(o.server.href, o.authorization ?? "", o.scopeId ?? "");
     const conversation = lru(sticky, sha256(key, ctx.origin ?? "unknown", ctx.protocol, ctx.session ?? "", ctx.cwd ?? ""), () => new Map(), maxSessions);
     const turnKey = (t) => sha256(String(t.index), t.text);
     // earlier turns get back the block each was sent with
@@ -125,7 +132,7 @@ async function run(body, ctx) {
         }
     }
     if (turn.text.includes(open)) {
-        if (ctx.state) {
+        if (o.capture && ctx.state) {
             const send = client(o);
             const scopeId = await scope(send, o, ctx);
             await bind(original, ctx, o, scopeId, send);
@@ -158,6 +165,9 @@ async function run(body, ctx) {
     const b = block(scopeId, context, handoff);
     b.scopeId = scopeId;
     lru(conversation, turnKey(turn), () => b, maxTurns);
+    // Count the full escaped block, not just the service's content_bytes.
+    conversation.bytes = [...conversation].reduce((n, [k, v]) => n + utf8(k) + utf8(v.text) + utf8(v.scopeId), 0);
+    trimCache(sticky, undefined, recallCacheBytes);
     ctx.report?.(b.bytes ? "ready" : "empty", b.bytes);
     if (!b.text)
         return changed ? body : undefined;
@@ -198,9 +208,14 @@ function options(raw = {}, env = process.env) {
     const idleCaptureMs = raw.idleCaptureMs ?? 10 * 60_000;
     if (!Number.isInteger(idleCaptureMs) || idleCaptureMs < 1000 || idleCaptureMs > 86_400_000)
         throw new Failure("invalid");
+    const requestTimeoutMs = raw.requestTimeoutMs ?? 1000;
+    const recallBackoffMs = raw.recallBackoffMs ?? 30_000;
+    if (!Number.isInteger(requestTimeoutMs) || requestTimeoutMs < 50 || requestTimeoutMs > 5000 ||
+        !Number.isInteger(recallBackoffMs) || recallBackoffMs < 100 || recallBackoffMs > 300_000)
+        throw new Failure("invalid");
     const authorizationEnv = text(raw.authorizationEnv) ?? "POWERCONTEXT_AUTHORIZATION";
     return {
-        server, maxBytes,
+        server, maxBytes, requestTimeoutMs, recallBackoffMs,
         authorization: text(raw.authorization) ?? text(env[authorizationEnv]),
         scopeId: text(raw.scopeId),
         capture: raw.capture ?? false,
@@ -283,25 +298,42 @@ function client(o) {
             headers["Content-Type"] = "application/json";
         if (o.authorization)
             headers.Authorization = o.authorization;
-        let r;
+        // Bound headers and body reads, even while the host's longer hook
+        // deadline is still open. Capture writes retain their own deadline.
+        const deadline = AbortSignal.timeout(route === "v1/sources/content" ? 10_000 : o.requestTimeoutMs);
+        const combined = AbortSignal.any([signal, deadline]);
         try {
-            r = await fetch(new URL(route, o.server), { method, headers, body: payload === undefined ? undefined : JSON.stringify(payload), signal, redirect: "error" });
+            combined.throwIfAborted();
+            let r;
+            try {
+                r = await fetch(new URL(route, o.server), { method, headers, body: payload === undefined ? undefined : JSON.stringify(payload), signal: combined, redirect: "error" });
+            }
+            catch {
+                throw new Failure("unavailable");
+            }
+            if (r.ok)
+                return { status: r.status, body: await json(r) };
+            await r.body?.cancel();
+            if (expected.includes(r.status))
+                return { status: r.status, body: undefined };
+            if (r.status === 401 || r.status === 403)
+                throw new Failure("unauthorized", r.status);
+            if (r.status === 409 || r.status === 422)
+                throw new Failure("invalid", r.status);
+            throw new Failure("unavailable", r.status);
         }
         catch (error) {
-            if (signal.aborted)
-                throw error;
-            throw new Failure("unavailable");
+            // Client cancellation never trips the service circuit breaker.
+            signal.throwIfAborted();
+            if (deadline.aborted)
+                error = new Failure("unavailable");
+            if (error instanceof Failure && error.code === "unavailable" && route !== "v1/sources/content") {
+                const key = serviceKey(o);
+                unavailable.delete(key);
+                lru(unavailable, key, () => Date.now() + o.recallBackoffMs, maxSessions);
+            }
+            throw error;
         }
-        if (r.ok)
-            return { status: r.status, body: await json(r) };
-        await r.body?.cancel();
-        if (expected.includes(r.status))
-            return { status: r.status, body: undefined };
-        if (r.status === 401 || r.status === 403)
-            throw new Failure("unauthorized", r.status);
-        if (r.status === 409 || r.status === 422)
-            throw new Failure("invalid", r.status);
-        throw new Failure("unavailable", r.status);
     };
 }
 async function json(r) {
@@ -312,7 +344,10 @@ async function json(r) {
     let size = 0;
     try {
         for (;;) {
-            const { value, done } = await reader.read();
+            let part;
+            try { part = await reader.read(); }
+            catch { throw new Failure("unavailable", r.status); }
+            const { value, done } = part;
             if (done)
                 break;
             size += value.byteLength;
@@ -368,8 +403,8 @@ async function prepare(send, o, key, scopeId, query, signal) {
 // one (503 while none is committed), or on any failure, it starts without.
 async function hint(send, scopeId, signal) {
     try {
-        const r = await send("POST", "v1/handoff/hint", { scope_id: scopeId, selection: "latest", max_bytes: hintBytes }, signal, [404]);
-        return r.status === 404 ? null : prepared(r.body, hintBytes);
+        const r = await send("POST", "v1/handoff/hint", { scope_id: scopeId, selection: "latest", max_bytes: hintBytes }, signal, [404, 503]);
+        return r.status === 404 || r.status === 503 ? null : prepared(r.body, hintBytes);
     }
     catch (error) {
         if (signal.aborted)
@@ -448,6 +483,8 @@ export function onResponse(reply, ctx) {
             ...body, input: [...state.responsePrefix, ...responseInput(body.input)], previous_response_id: undefined,
         };
     if (ctx.protocol === "responses" && typeof reply.id === "string" && Array.isArray(reply.output)) {
+        if (hasSecret([...history(body, ctx.protocol), ...history({ input: reply.output }, "responses")]))
+            return;
         const key = sha256(state.cacheIdentity, reply.id);
         responses.delete(key);
         const input = [...responseInput(body.input), ...reply.output];
@@ -455,12 +492,10 @@ export function onResponse(reply, ctx) {
         trimCache(responses);
     }
     const captured = transcript(body, reply, ctx.protocol);
-    if (!captured)
+    if (!captured || hasSecret(captured.messages))
         return;
     const visible = visibleMessages(captured.messages);
     const content = JSON.stringify(captured);
-    if (secret.test(content))
-        return;
     const bytes = utf8(content);
     const metadata = { origin: "magpie", event: "conversation_completed", protocol: ctx.protocol };
     if (ctx.session)
@@ -517,16 +552,32 @@ function persist(p) {
         }
     })();
 }
+// Inspect message text and tool arguments before the outer transcript is
+// serialized. Structured tool values need their field names checked too.
+function hasSecret(value) {
+    if (typeof value === "string") {
+        if (secret.test(value))
+            return true;
+        if (/^\s*[\[{]/u.test(value)) {
+            try { return hasSecret(JSON.parse(value)); } catch { /* plain text */ }
+        }
+        return false;
+    }
+    if (!value || typeof value !== "object")
+        return false;
+    return Object.entries(value).some(([key, item]) => secret.test(`${key}: ${typeof item === "string" ? item : "[value]"}`) || hasSecret(item));
+}
 // --- small things ---
+function serviceKey(o) { return sha256(o.server.href, o.authorization ?? "", o.scopeId ?? ""); }
 function sha256(...parts) { return createHash("sha256").update(parts.join("\0")).digest("hex"); }
 function utf8(text) { return Buffer.byteLength(text, "utf8"); }
-function trimCache(map, evict) {
-    let bytes = [...map.values()].reduce((total, value) => total + value.bytes, 0);
+function trimCache(map, evict, limit = captureCacheBytes) {
+    let bytes = [...map.values()].reduce((total, value) => total + (value.bytes ?? 0), 0);
     for (const [key, value] of map) {
-        if (bytes <= captureCacheBytes)
+        if (bytes <= limit)
             break;
         map.delete(key);
-        bytes -= value.bytes;
+        bytes -= value.bytes ?? 0;
         evict?.(value);
     }
 }

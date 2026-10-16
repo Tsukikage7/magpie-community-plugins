@@ -452,7 +452,7 @@ test("a server under a path, with a Scope set, is the only one asked", async () 
 test("options it can't use are invalid, before anything is sent", async () => {
   mock()
   for (const bad of [{ serverUrl: "http://remote.example" }, { serverUrl: "https://u:p@context.example" }, { serverUrl: "https://context.example/?t=1" },
-    { maxBytes: 100 }, { maxBytes: "8000" }, { capture: "yes" }, { captureRemote: "yes" }, { recallRemote: "yes" }, { scopeId: 7 }]) {
+    { requestTimeoutMs: 0 }, { requestTimeoutMs: "1000" }, { requestTimeoutMs: 5001 }, { recallBackoffMs: 99 }, { recallBackoffMs: 300001 }, { maxBytes: 100 }, { maxBytes: "8000" }, { capture: "yes" }, { captureRemote: "yes" }, { recallRemote: "yes" }, { scopeId: 7 }]) {
     const [reports, c] = reporting("chat", { options: bad })
     await expect(onRequest(structuredClone(chat), c)).rejects.toThrow("PowerContext invalid")
     expect(reports).toEqual([["invalid"]])
@@ -628,4 +628,134 @@ test("an uncertain Source write is not retried", async () => {
   await onRequest(nextTurn(), lifecycle({ query: "And its owner?" }))
   await new Promise(r => setTimeout(r, 2300))
   expect(of("/v1/sources/content")).toHaveLength(1)
+})
+
+for (const value of ['{"password": "hunter2xyz"}', 'DB_PASSWORD="hunter2xyz"', '{"client_secret":"abcdef123456"}', 'export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI']) {
+  for (const location of ["user", "tool result", "tool arguments"]) {
+    test(`capture excludes ${location} holding ${value.split(/[=:]/)[0]}`, async () => {
+      mock()
+      const body = { messages: [
+        { role: "user", content: location === "user" ? value : "Inspect configuration" },
+        { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "inspect", arguments: location === "tool arguments" ? value : "{}" } }] },
+        { role: "tool", tool_call_id: "c1", content: location === "tool result" ? value : "configuration inspected" },
+      ] }
+      const original = structuredClone(body)
+      const c = lifecycle()
+      await onRequest(body, c)
+      onResponse(reply, c)
+      await onRequest({ messages: [...original.messages, reply.choices[0].message, { role: "user", content: "Next question" }] }, lifecycle({ query: "Next question" }))
+      await settle()
+      expect(of("/v1/sources/content")).toHaveLength(0)
+    })
+  }
+}
+
+test("recall byte pressure evicts whole old conversations and preserves recent turns", async () => {
+  // Below both count limits; only the byte budget can force eviction.
+  mock("界".repeat(10922))
+  const request = (session, turn) => onRequest({ messages: [{ role: "user", content: `question-${turn}` }] }, ctx("chat", { session, query: `question-${turn}`, options: { maxBytes: 32768 } }))
+  for (let session = 0; session < 12; session++) {
+    for (let turn = 0; turn < 24; turn++) await request(`bytes-${session}`, turn)
+  }
+  calls.length = 0
+  await request("bytes-11", 0)
+  await request("bytes-11", 23)
+  expect(calls).toHaveLength(0)
+  await request("bytes-0", 0)
+  expect(of("/v1/context/prepare")).toHaveLength(1)
+  await request("bytes-0", 23)
+  expect(of("/v1/context/prepare")).toHaveLength(2)
+  await request("bytes-11", 0)
+  expect(of("/v1/context/prepare")).toHaveLength(2)
+})
+
+test("capture-off continuations and retained blocks never resolve a Scope", async () => {
+  mock()
+  const bodies = [
+    ["responses", { previous_response_id: "known", input: [{ type: "function_call_output", call_id: "c1", output: "done" }] }],
+    ["chat", { messages: [{ role: "user", content: "Question\n<powercontext-reference>already supplied</powercontext-reference>" }] }],
+  ]
+  for (const [protocol, body] of bodies) {
+    expect(await onRequest(structuredClone(body), ctx(protocol, { query: "", state: {} }))).toBeUndefined()
+  }
+  expect(calls).toHaveLength(0)
+})
+
+for (const route of ["scope", "prepare", "hint", "body"]) {
+  test(`a hung ${route} has its own deadline, backs off and recovers`, async () => {
+    globalThis.fetch = realFetch
+    const hits = []
+    let healthy = false
+    const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch(req) {
+      const path = new URL(req.url).pathname
+      hits.push(path)
+      const hung = !healthy && ((route === "scope" && path.endsWith("resolve")) || (["prepare", "body"].includes(route) && path.endsWith("prepare")) || (route === "hint" && path.endsWith("hint")))
+      if (hung) {
+        if (route === "body") return new Response(new ReadableStream({ start() {} }))
+        return new Promise(() => {})
+      }
+      if (path.endsWith("resolve")) return Response.json({ scope_id: "live-scope" })
+      if (path.endsWith("hint")) return new Response(null, { status: 404 })
+      return prepared("recovered recall")
+    } })
+    const make = () => ctx("chat", { options: { serverUrl: server.url.href, requestTimeoutMs: 50, recallBackoffMs: 100 } })
+    try {
+      const start = performance.now()
+      if (route === "hint") await onRequest(structuredClone(chat), make())
+      else await expect(onRequest(structuredClone(chat), make())).rejects.toThrow("PowerContext unavailable")
+      expect(performance.now() - start).toBeLessThan(1000)
+      const count = hits.length
+      const body = structuredClone(chat)
+      expect(await onRequest(body, make())).toBeUndefined()
+      expect(body).toEqual(chat)
+      expect(hits).toHaveLength(count)
+      // Another configured service identity is not blocked by this one.
+      const other = make(); other.options.scopeId = "another-scope"
+      healthy = true
+      expect(JSON.stringify(await onRequest(structuredClone(chat), other))).toContain("recovered recall")
+      await new Promise(r => setTimeout(r, 120))
+      const recovered = await onRequest(structuredClone(chat), make())
+      expect(JSON.stringify(recovered)).toContain("recovered recall")
+    } finally { server.stop(true) }
+  })
+}
+
+test("client cancellation preserves its reason and does not back off the service", async () => {
+  mock()
+  const abort = new AbortController()
+  abort.abort(new Error("caller cancelled"))
+  const c = ctx("chat", { signal: abort.signal })
+  await expect(onRequest(structuredClone(chat), c)).rejects.toThrow("caller cancelled")
+  expect(JSON.stringify(await onRequest(structuredClone(chat), ctx("chat")))).toContain("QUARTZ-8413")
+})
+
+test("connection failure backs off without caching failure as an empty turn", async () => {
+  mock("x", { "/v1/scope-bindings/resolve": () => { throw new Error("connection refused") } })
+  await expect(onRequest(structuredClone(chat), ctx("chat"))).rejects.toThrow("PowerContext unavailable")
+  const count = calls.length
+  expect(await onRequest(structuredClone(chat), ctx("chat"))).toBeUndefined()
+  expect(calls).toHaveLength(count)
+  reset()
+  mock("recovered")
+  expect(JSON.stringify(await onRequest(structuredClone(chat), ctx("chat")))).toContain("recovered")
+})
+
+test("structured native tool arguments containing prefixed secrets are not captured", async () => {
+  mock()
+  for (const protocol of ["anthropic", "gemini"]) {
+    for (const argumentsValue of [{ password: "hunter2xyz" }, { DB_PASSWORD: "hunter2xyz" }, { client_secret: "abcdef123456" }, { AWS_SECRET_ACCESS_KEY: "wJalrXUtnFEMI" }]) {
+      reset(); calls.length = 0
+      const tool = protocol === "anthropic"
+        ? [{ role: "user", content: "Inspect configuration" }, { role: "assistant", content: [{ type: "tool_use", id: "c1", name: "inspect", input: argumentsValue }] }, { role: "user", content: [{ type: "tool_result", tool_use_id: "c1", content: "inspected" }] }]
+        : [{ role: "user", parts: [{ text: "Inspect configuration" }] }, { role: "model", parts: [{ functionCall: { id: "c1", name: "inspect", args: argumentsValue } }] }, { role: "user", parts: [{ functionResponse: { id: "c1", name: "inspect", response: { text: "inspected" } } }] }]
+      const body = protocol === "anthropic" ? { messages: tool } : { contents: tool }
+      const c = { ...lifecycle({ options: { idleCaptureMs: 1000 } }), protocol }
+      await onRequest(body, c)
+      onResponse(protocol === "anthropic" ? { role: "assistant", content: [{ type: "text", text: "done" }], stop_reason: "end_turn" } : { candidates: [{ content: { role: "model", parts: [{ text: "done" }] }, finishReason: "STOP" }] }, c)
+      const next = protocol === "anthropic" ? { messages: [{ role: "user", content: "Next question" }] } : { contents: [{ role: "user", parts: [{ text: "Next question" }] }] }
+      await onRequest(next, { ...lifecycle({ query: "Next question" }), protocol })
+      await settle()
+      expect(of("/v1/sources/content")).toHaveLength(0)
+    }
+  }
 })

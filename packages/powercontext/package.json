@@ -26,6 +26,8 @@
     "options": {
       "authorizationEnv": "POWERCONTEXT_AUTHORIZATION",
       "gatewayTimeoutMs": 5000,
+      "requestTimeoutMs": 1000,
+      "recallBackoffMs": 30000,
       "maxBytes": 8000,
       "capture": false,
       "captureRemote": false,

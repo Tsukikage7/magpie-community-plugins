@@ -90,6 +90,18 @@ or skill.
   are isolated by origin and protocol, including when remote recall is allowed.
 - `maxBytes`: recall budget, default 8000 bytes.
 - `gatewayTimeoutMs`: Magpie's bounded async hook deadline, default 5000 ms.
+- `requestTimeoutMs`: deadline for each Scope, context and Handoff request,
+  including response body reads; default 1000 ms, range 50–5000 ms. The host's
+  cancellation/deadline can end it earlier. A recall normally resolves Scope
+  first, then prepares context and a first-turn Handoff in parallel, so its
+  service wait can span two such deadlines, bounded by the host deadline.
+- `recallBackoffMs`: after a service connection failure, timeout or unavailable
+  response, skip service lookup and cache replay for this Server/credential/Scope
+  configuration; default 30000 ms, range 100–300000 ms. The next request after
+  that interval can try again; continued failure starts another interval.
+  Client cancellation does not trigger backoff. A missing/pending Handoff
+  (404/503) is normal and does not trigger backoff. Source writes retain their
+  separate ten-second deadline and are not retried.
 - `capture`: enable completed-conversation capture, default **false**. Recall
   works independently. Set `"capture": true` explicitly in Options to opt in.
 - `captureRemote`: default **false**. With capture enabled, only host-classified
@@ -116,8 +128,22 @@ Chat Completions, Responses, Anthropic Messages and Gemini requests retain their
 protocol. Context is escaped and enclosed as untrusted reference text in the
 latest user message, preserving prior context blocks for prompt caching. Latest
 committed Handoff hints accompany recall when available. Credentials are not
-included in model input. Timeout, invalid context, unauthorized access and a
-service outage keep inference available.
+included in model input. Sticky recall has an 8 MiB encoded-byte budget for
+all conversations combined, in addition to 256 conversations and 128 turns per
+conversation. It counts full escaped reference blocks, Scope IDs and turn keys;
+oldest-used whole conversations are evicted first. Evicted turns can be recalled
+again, so prompt-prefix retention is best-effort under memory pressure. This is
+a cache payload limit, not a bound on the Bun process's total heap.
+Timeout, invalid context, unauthorized access and a service outage keep
+inference available. With capture off, tool-only continuations and turns that
+already contain a reference block do not perform a Scope lookup.
+
+Before staging or saving conversation history, the plugin checks message text
+and tool arguments/results for credential-like assignments, JSON fields,
+prefixed environment variables and common token formats. A match skips the
+whole capture, rather than redacting parts. This is a best-effort safeguard,
+not a guarantee that arbitrary secrets can be identified; capture remains an
+explicit opt-in for content permitted on the configured Server.
 
 Capture stores the complete conversation available to the request: user and
 assistant messages, plus client-owned tool calls and results when supplied by
