@@ -140,7 +140,8 @@ already contain a reference block do not perform a Scope lookup.
 
 Before staging or saving conversation history, the plugin checks message text
 and tool arguments/results for credential-like assignments, JSON fields,
-prefixed environment variables and common token formats. A match skips the
+prefixed environment variables (including `PGPASSWORD` and `MYSQL_PWD`) and
+common token formats. A match skips the
 whole capture, rather than redacting parts. This is a best-effort safeguard,
 not a guarantee that arbitrary secrets can be identified; capture remains an
 explicit opt-in for content permitted on the configured Server.

@@ -630,7 +630,7 @@ test("an uncertain Source write is not retried", async () => {
   expect(of("/v1/sources/content")).toHaveLength(1)
 })
 
-for (const value of ['{"password": "hunter2xyz"}', 'DB_PASSWORD="hunter2xyz"', '{"client_secret":"abcdef123456"}', 'export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI']) {
+for (const value of ['{"password": "hunter2xyz"}', 'DB_PASSWORD="hunter2xyz"', '{"client_secret":"abcdef123456"}', 'export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI', 'PGPASSWORD=abc', 'MYSQL_PWD=abc']) {
   for (const location of ["user", "tool result", "tool arguments"]) {
     test(`capture excludes ${location} holding ${value.split(/[=:]/)[0]}`, async () => {
       mock()
@@ -743,7 +743,7 @@ test("connection failure backs off without caching failure as an empty turn", as
 test("structured native tool arguments containing prefixed secrets are not captured", async () => {
   mock()
   for (const protocol of ["anthropic", "gemini"]) {
-    for (const argumentsValue of [{ password: "hunter2xyz" }, { DB_PASSWORD: "hunter2xyz" }, { client_secret: "abcdef123456" }, { AWS_SECRET_ACCESS_KEY: "wJalrXUtnFEMI" }]) {
+    for (const argumentsValue of [{ password: "hunter2xyz" }, { DB_PASSWORD: "hunter2xyz" }, { client_secret: "abcdef123456" }, { AWS_SECRET_ACCESS_KEY: "wJalrXUtnFEMI" }, { PGPASSWORD: "abc" }, { MYSQL_PWD: "abc" }]) {
       reset(); calls.length = 0
       const tool = protocol === "anthropic"
         ? [{ role: "user", content: "Inspect configuration" }, { role: "assistant", content: [{ type: "tool_use", id: "c1", name: "inspect", input: argumentsValue }] }, { role: "user", content: [{ type: "tool_result", tool_use_id: "c1", content: "inspected" }] }]
