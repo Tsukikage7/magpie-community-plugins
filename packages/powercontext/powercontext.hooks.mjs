@@ -45,7 +45,7 @@ const foreign = [
 ];
 // A prompt that looks like it holds a credential is not saved at all:
 // masking part of it could still leave the rest on the server.
-const secret = /(?:(?:^|[^A-Za-z0-9])(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|access[_-]?key|access[_-]?token|token|authorization|[A-Za-z0-9]*(?:password|passwd|pwd)|secret|private[_-]?key|client[_-]?secret)["']?\s*[:=]\s*\S+|\bbearer\s+[A-Za-z0-9._~+/=-]{8,}|\bsk-[A-Za-z0-9_-]{8,}|\bgh[pousr]_[A-Za-z0-9]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}|\bxox[abprs]-[A-Za-z0-9-]{10,}|\bAKIA[0-9A-Z]{16}\b|-----BEGIN [^-]*PRIVATE KEY-----)/iu;
+const secret = /(?:(?:^|[^A-Za-z0-9])(?:[A-Za-z0-9]+[_-])*(?:api[_-]?key|access[_-]?key|access[_-]?token|token|authorization|[A-Za-z0-9]*(?:password|passwd|pwd)|secret|private[_-]?key|client[_-]?secret)["']?\s*[:=]\s*\S+|\b[a-z][a-z0-9+.-]*:\/\/[^\s/?#@]+:[^\s/?#@]+@|\b(?:sk|rk)_live_[A-Za-z0-9]{8,}|\bAIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])|\bbearer\s+[A-Za-z0-9._~+/=-]{8,}|\bsk-[A-Za-z0-9_-]{8,}|\bgh[pousr]_[A-Za-z0-9]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}|\bxox[abprs]-[A-Za-z0-9-]{10,}|\bAKIA[0-9A-Z]{16}\b|-----BEGIN [^-]*PRIVATE KEY-----)/iu;
 // The only codes magpie's Plugins page shows: an error's own text may hold
 // a token, a prompt or recalled material.
 class Failure extends Error {
@@ -61,6 +61,7 @@ class Failure extends Error {
 const sticky = new Map();
 const unsectioned = new Map();
 const unavailable = new Map();
+const handoffUnavailable = new Map();
 const recallCacheBytes = 8 << 20;
 const maxSessions = 256;
 const maxTurns = 128;
@@ -71,12 +72,14 @@ export function reset() {
     sticky.clear();
     unsectioned.clear();
     unavailable.clear();
+    handoffUnavailable.clear();
     responses.clear();
     for (const p of pending.values())
         clearTimeout(p.timer);
     pending.clear();
 }
 export async function onRequest(body, ctx) {
+    ctx.state ??= {};
     try {
         return await run(body, ctx);
     }
@@ -159,7 +162,7 @@ async function run(body, ctx) {
     const first = all.filter((t) => t.role === "user").length === 1;
     const [context, handoff] = await Promise.all([
         prepare(send, o, key, scopeId, query, ctx.signal),
-        first ? hint(send, scopeId, ctx.signal) : null,
+        first ? hint(send, o, scopeId, ctx.signal) : null,
     ]);
     ctx.signal.throwIfAborted();
     const b = block(scopeId, context, handoff);
@@ -327,7 +330,7 @@ function client(o) {
             signal.throwIfAborted();
             if (deadline.aborted)
                 error = new Failure("unavailable");
-            if (error instanceof Failure && error.code === "unavailable" && route !== "v1/sources/content") {
+            if (error instanceof Failure && error.code === "unavailable" && route !== "v1/sources/content" && route !== "v1/handoff/hint") {
                 const key = serviceKey(o);
                 unavailable.delete(key);
                 lru(unavailable, key, () => Date.now() + o.recallBackoffMs, maxSessions);
@@ -401,7 +404,12 @@ async function prepare(send, o, key, scopeId, query, signal) {
 }
 // hint orients a new conversation by the Scope's latest Handoff. Without
 // one (503 while none is committed), or on any failure, it starts without.
-async function hint(send, scopeId, signal) {
+async function hint(send, o, scopeId, signal) {
+    // A Handoff is optional. Its failure must not disable healthy Memory
+    // recall; back off this endpoint independently, including resolved Scope.
+    const key = sha256(serviceKey(o), scopeId);
+    if ((handoffUnavailable.get(key) ?? 0) > Date.now())
+        return null;
     try {
         const r = await send("POST", "v1/handoff/hint", { scope_id: scopeId, selection: "latest", max_bytes: hintBytes }, signal, [404, 503]);
         return r.status === 404 || r.status === 503 ? null : prepared(r.body, hintBytes);
@@ -409,6 +417,10 @@ async function hint(send, scopeId, signal) {
     catch (error) {
         if (signal.aborted)
             throw error;
+        if (error instanceof Failure && error.code === "unavailable") {
+            handoffUnavailable.delete(key);
+            lru(handoffUnavailable, key, () => Date.now() + o.recallBackoffMs, maxSessions);
+        }
         return null;
     }
 }

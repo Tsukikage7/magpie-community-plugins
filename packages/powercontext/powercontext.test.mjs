@@ -2,11 +2,26 @@
 // faked with fetch: no server, no sign-in and no network.
 import { afterEach, beforeEach, expect, test } from "bun:test"
 import { createHash } from "node:crypto"
-import { onRequest, onResponse, reset } from "./powercontext.gateway.mjs"
+import { runInNewContext } from "node:vm"
+import { onRequest, onResponse, reset } from "./powercontext.hooks.mjs"
 
 const realFetch = globalThis.fetch
 const calls = []
 let routes = {}
+
+test("the shipped entry uses Bun hooks rather than synchronous middleware", async () => {
+  const pkg = await Bun.file(new URL("./package.json", import.meta.url)).json()
+  expect(pkg.main).toBeUndefined()
+  expect(pkg.bin).toBeUndefined()
+  expect(pkg.magpie.permissions ?? []).toEqual([])
+  expect(pkg.files).toEqual(["powercontext.hooks.mjs", "conversation.mjs", "README.md", "page"])
+  expect(pkg.magpie.gateway).toBeUndefined()
+  expect(pkg.magpie.hooks).toBe("./powercontext.hooks.mjs")
+  expect(pkg.files).toContain(pkg.magpie.hooks.slice(2))
+  const entry = await import(pkg.magpie.hooks)
+  expect(entry.onRequest).toBe(onRequest)
+  expect(entry.onResponse).toBe(onResponse)
+})
 
 const prepared = (content) => Response.json({
   schema: "powercontext.prepared-context.v1", status: content === null ? "empty" : "ready",
@@ -630,7 +645,7 @@ test("an uncertain Source write is not retried", async () => {
   expect(of("/v1/sources/content")).toHaveLength(1)
 })
 
-for (const value of ['{"password": "hunter2xyz"}', 'DB_PASSWORD="hunter2xyz"', '{"client_secret":"abcdef123456"}', 'export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI', 'PGPASSWORD=abc', 'MYSQL_PWD=abc']) {
+for (const value of ['{"password": "hunter2xyz"}', 'DB_PASSWORD="hunter2xyz"', '{"client_secret":"abcdef123456"}', 'export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI', 'PGPASSWORD=abc', 'MYSQL_PWD=abc', 'DATABASE_URL=postgres://admin:S3cretPass@db.internal:5432/app', 'STRIPE_KEY=sk_live_51HxYzAbCdEfGh', 'STRIPE_KEY=rk_live_51HxYzAbCdEfGh', 'GOOGLE_KEY=AIza' + 'A'.repeat(35)]) {
   for (const location of ["user", "tool result", "tool arguments"]) {
     test(`capture excludes ${location} holding ${value.split(/[=:]/)[0]}`, async () => {
       mock()
@@ -706,9 +721,15 @@ for (const route of ["scope", "prepare", "hint", "body"]) {
       expect(performance.now() - start).toBeLessThan(1000)
       const count = hits.length
       const body = structuredClone(chat)
-      expect(await onRequest(body, make())).toBeUndefined()
-      expect(body).toEqual(chat)
-      expect(hits).toHaveLength(count)
+      const result = await onRequest(body, make())
+      if (route === "hint") {
+        expect(JSON.stringify(result)).toContain("recovered recall")
+        expect(hits).toHaveLength(count) // the successful turn remains sticky
+      } else {
+        expect(result).toBeUndefined()
+        expect(body).toEqual(chat)
+        expect(hits).toHaveLength(count)
+      }
       // Another configured service identity is not blocked by this one.
       const other = make(); other.options.scopeId = "another-scope"
       healthy = true
@@ -743,7 +764,7 @@ test("connection failure backs off without caching failure as an empty turn", as
 test("structured native tool arguments containing prefixed secrets are not captured", async () => {
   mock()
   for (const protocol of ["anthropic", "gemini"]) {
-    for (const argumentsValue of [{ password: "hunter2xyz" }, { DB_PASSWORD: "hunter2xyz" }, { client_secret: "abcdef123456" }, { AWS_SECRET_ACCESS_KEY: "wJalrXUtnFEMI" }, { PGPASSWORD: "abc" }, { MYSQL_PWD: "abc" }]) {
+    for (const argumentsValue of [{ password: "hunter2xyz" }, { DB_PASSWORD: "hunter2xyz" }, { client_secret: "abcdef123456" }, { AWS_SECRET_ACCESS_KEY: "wJalrXUtnFEMI" }, { PGPASSWORD: "abc" }, { MYSQL_PWD: "abc" }, { DATABASE_URL: "postgres://admin:S3cretPass@db.internal:5432/app" }, { STRIPE_KEY: "sk_live_51HxYzAbCdEfGh" }, { STRIPE_KEY: "rk_live_51HxYzAbCdEfGh" }, { GOOGLE_KEY: "AIza" + "A".repeat(35) }]) {
       reset(); calls.length = 0
       const tool = protocol === "anthropic"
         ? [{ role: "user", content: "Inspect configuration" }, { role: "assistant", content: [{ type: "tool_use", id: "c1", name: "inspect", input: argumentsValue }] }, { role: "user", content: [{ type: "tool_result", tool_use_id: "c1", content: "inspected" }] }]
@@ -757,5 +778,129 @@ test("structured native tool arguments containing prefixed secrets are not captu
       await settle()
       expect(of("/v1/sources/content")).toHaveLength(0)
     }
+  }
+})
+
+// Handoff is optional: its outage must not disable successful Memory recall.
+test("a timed-out optional Handoff does not back off healthy context recall", async () => {
+  globalThis.fetch = realFetch
+  let hints = 0, prepares = 0
+  const server = Bun.serve({hostname:"127.0.0.1",port:0,fetch(req) {
+    const path = new URL(req.url).pathname
+    if (path.endsWith("resolve")) return Response.json({scope_id:"scope"})
+    if (path.endsWith("hint")) { hints++; return new Promise(() => {}) }
+    prepares++
+    return prepared("healthy Memory")
+  }})
+  const make = (session) => ctx("chat", {session, options:{serverUrl:server.url.href,requestTimeoutMs:50,recallBackoffMs:30_000}})
+  try {
+    expect(JSON.stringify(await onRequest(structuredClone(chat),make("first")))).toContain("healthy Memory")
+    expect(JSON.stringify(await onRequest(structuredClone(chat),make("second")))).toContain("healthy Memory")
+    expect(prepares).toBe(2)
+    expect(hints).toBe(1)
+  } finally {server.stop(true)}
+})
+
+// The official sandbox page may configure options, but has no network or custom host API.
+test("configuration page uses only the released options and theme bridge", async () => {
+  const source = await Bun.file(new URL("./page/settings.js", import.meta.url)).text()
+  const calls = [...source.matchAll(/magpie\.([\w.]+)/g)].map((match) => match[1])
+  expect([...new Set(calls)].sort()).toEqual(["onTheme", "options.get", "options.set", "ready.then", "theme"])
+  expect(source).not.toMatch(/\b(fetch|XMLHttpRequest|WebSocket|EventSource)\b/)
+})
+
+test("configuration page saves a masked service key for hook authentication and preserves environment fallback", async () => {
+  const read = (file) => Bun.file(new URL(`./page/${file}`, import.meta.url)).text()
+  const [dictionary, source, html] = await Promise.all([read("i18n.js"), read("settings.js"), read("settings.html")])
+  const elements = Object.fromEntries([...html.matchAll(/\bid="([^"]+)"/g)].map(([, id]) => [id, {
+    dataset: {}, value: "", type: id === "auth" ? "password" : "text",
+    setAttribute(name, value) { this[name] = value }, focus() {}, showModal() {},
+  }]))
+  const document = {
+    documentElement: {}, getElementById: (id) => elements[id], querySelectorAll: () => [],
+  }
+  let options = {serverUrl:"http://127.0.0.1:8000", scopeId:"test-scope", authorizationEnv:"LEGACY_AUTH", capture:true, maxBytes:4096}
+  let writes = 0
+  const magpie = {
+    theme: {lang:"en"}, ready: Promise.resolve(), onTheme() {},
+    options: {get: async () => ({...options}), set: async (next) => { options = {...next}; writes++ }},
+  }
+  runInNewContext(`${dictionary}\n${source}`, {document, magpie, navigator:{language:"en"}, URL})
+  await new Promise(setImmediate)
+  const save = () => elements.save.onclick({preventDefault() {}})
+  const original = {...options}
+  for (const input of ["synthetic-page-token", "Bearer synthetic-page-token"]) {
+    elements.auth.value = input
+    await save()
+    expect(options).toEqual({...original, serverUrl:"http://127.0.0.1:8000/", authorization:"Bearer synthetic-page-token"})
+  }
+  // Run the shipped hook with exactly what the page saved, not a second normalizer.
+  mock()
+  await onRequest(chat, ctx("chat", {options}))
+  expect(of("/v1/context/prepare")[0].init.headers.Authorization).toBe("Bearer synthetic-page-token")
+  elements.configure.onclick()
+  expect(elements.auth.type).toBe("password")
+  expect(elements.auth.value).toBe("synthetic-page-token")
+  elements["show-auth"].onclick()
+  expect(elements.auth.type).toBe("text")
+  expect(elements["show-auth"]["aria-pressed"]).toBe("true")
+  elements.settings.onclose()
+  expect(elements.auth.type).toBe("password")
+  expect(elements.auth.value).toBe("")
+  for (const invalid of ["bad key", "bad\nkey"]) {
+    elements.auth.value = invalid
+    await save()
+    expect(writes).toBe(2)
+    expect(elements.result.dataset.message).toBe("invalidKey")
+  }
+  elements.auth.value = ""
+  await save()
+  expect(options.authorization).toBeUndefined()
+  expect(options.authorizationEnv).toBe("LEGACY_AUTH")
+  expect(options.capture).toBe(true)
+  expect(options.maxBytes).toBe(4096)
+})
+
+test("configuration page follows all host languages without losing edits or status messages", async () => {
+  const read = (file) => Bun.file(new URL(`./page/${file}`, import.meta.url)).text()
+  const [dictionary, source, html] = await Promise.all([read("i18n.js"), read("settings.js"), read("settings.html")])
+  const elements = Object.fromEntries([...html.matchAll(/\bid="([^"]+)"/g)].map(([, id]) => [id, {
+    dataset: {}, value: "", hidden: false, setAttribute(name, value) { this[name] = value }, focus() {},
+  }]))
+  const translated = [...html.matchAll(/data-t="([^"]+)"/g)].map(([, key]) => ({dataset: {t:key}}))
+  const document = {
+    documentElement: {}, getElementById: (id) => elements[id],
+    querySelectorAll: (selector) => selector === "[data-t]" ? translated : Object.values(elements).filter((el) => el.dataset.message),
+  }
+  let repaint
+  const magpie = {
+    theme: {lang:"zh"}, ready: Promise.resolve(), onTheme: (fn) => { repaint = fn },
+    options: {get: async () => ({serverUrl:"http://127.0.0.1:8000", scopeId:"test-scope", maxBytes:8000, capture:true})},
+  }
+  const context = {document, magpie, navigator:{language:"en"}, URL}
+  const {messages, languageFor, languageTags} = runInNewContext(`${dictionary}\n${source}\npowercontextI18n`, context)
+  await new Promise(setImmediate)
+  for (const language of ["en", "zh", "zh-TW", "ja", "de"]) {
+    expect(Object.keys(messages[language]).sort()).toEqual(Object.keys(messages.en).sort())
+    expect(Object.values(messages[language]).every((text) => typeof text === "string" && text.length > 0)).toBe(true)
+  }
+  for (const [input, expected] of [["zh-CN","zh"], ["zh-Hant-TW","zh-TW"], ["zh_HK","zh-TW"], ["ja-JP","ja"], ["de-AT","de"], ["fr-FR","en"]]) {
+    expect(languageFor(input)).toBe(expected)
+  }
+  // Leave a validation error and an unsaved edit visible, then change the actual bridge theme.
+  elements.url.value = "unsaved address"
+  await elements.save.onclick({preventDefault() {}})
+  for (const language of ["en", "zh-TW", "ja", "de", "zh"]) {
+    magpie.theme.lang = language
+    repaint()
+    expect(document.documentElement.lang).toBe(languageTags[language])
+    expect(elements.url.value).toBe("unsaved address")
+    expect(elements.configured.textContent).toBe(messages[language].loaded)
+    expect(elements.result.textContent).toBe(messages[language].invalidUrl)
+    expect(elements.result.dataset.error).toBe("true")
+    expect(elements.close["aria-label"]).toBe(messages[language].close)
+    expect(elements["summary-capture"].title).toBe(messages[language].captureHelp)
+    expect(elements["capture-state"].textContent).toBe(messages[language].on)
+    for (const el of translated) expect(el.textContent).toBe(messages[language][el.dataset.t])
   }
 })

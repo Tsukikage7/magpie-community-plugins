@@ -104,6 +104,7 @@ These add a page to magpie's window, in the app and in `magpie web`, under Plugi
 | Package | Page | Reads |
 |---|---|---|
 | [usage](packages/usage) | Usage glance: calls, errors, tokens and cost for today, 7 or 30 days, and the models behind them | `usage:summary` |
+| [powercontext](packages/powercontext) | Connection settings for an independently deployed PowerContext service | None |
 
 ```sh
 magpie plugin add @magpie-community/page-<name>
@@ -117,13 +118,13 @@ A page package is a folder under `packages/<name>/` with:
 
 ## Gateway hooks
 
-Like middleware, these run on the requests agents send, but in magpie's Bun host rather than on moejs, so one can wait on a service, keep state and import Node's built-ins. They need magpie with gateway hooks (`magpie.gateway`), which isn't released yet, so they aren't in `registry.json`.
+Like middleware, these run on the requests agents send, but in magpie's Bun host rather than on moejs, so one can wait on a service, keep state and import Node's built-ins. They require Magpie 0.1.1273 or newer and declare `magpie.hooks`. The PowerContext package remains pending review for `registry.json`.
 
 | Package | What it does |
 |---|---|
 | [powercontext](packages/powercontext) | [PowerContext](https://github.com/oceanbase/powercontext) recall and opt-in completed-conversation capture; no client MCP or skill required |
 
-Use the same plugin management commands as middleware. For the unreleased
+Use the same plugin management commands as middleware. For the unpublished
 PowerContext package, install from a local checkout:
 
 ```sh
@@ -138,14 +139,13 @@ Scope in plugin options. No Server URL is assumed and capture defaults to off;
 remote/shared-key recall and capture each need a separate opt-in. The package calls an existing
 Server; it does not provision services or manage processes. See the
 [plugin README](packages/powercontext).
-Adoption depends on the async hooks proposed in
-[yetone/magpie#2118](https://github.com/yetone/magpie/issues/2118) and a compatible
-Magpie version; no released host version is claimed yet.
+The asynchronous hook API shipped in Magpie 0.1.1273; see the
+[released host contract](https://github.com/yetone/magpie/blob/v0.1.1273/docs/subsystems/gateway-request-hooks.md).
 
 A gateway hook package is a folder under `packages/<name>/` with:
 
-- **`package.json`**: name `@magpie-community/gateway-<name>`, `"magpie": {"gateway": "./<name>.gateway.mjs", "options": {…}}`, no `main`.
-- **`<name>.gateway.mjs`**: exports async `onRequest(body, ctx)` to add context. Optional `onResponse(reply, ctx)` observes a completed reply through a bounded, best-effort notification. The hooks share request-local `ctx.state`. Client tool declarations and execution loops remain client-owned.
+- **`package.json`**: name `@magpie-community/gateway-<name>`, `"magpie": {"hooks": "./<name>.hooks.mjs", "options": {…}}`, no `main`.
+- **`<name>.hooks.mjs`**: exports async `onRequest(body, ctx)` to add context. Optional `onResponse(reply, ctx)` observes a completed reply through a bounded, best-effort notification. The hooks share request-local `ctx.state`. Client tool declarations and execution loops remain client-owned.
 - tests that call the hooks the way the gateway does, with any service they talk to faked.
 
 ## Agents

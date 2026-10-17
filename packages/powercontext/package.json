@@ -4,9 +4,10 @@
   "description": "PowerContext context recall and asynchronous conversation capture for clients behind Magpie",
   "type": "module",
   "files": [
-    "powercontext.gateway.mjs",
+    "powercontext.hooks.mjs",
     "conversation.mjs",
-    "README.md"
+    "README.md",
+    "page"
   ],
   "keywords": [
     "magpie",
@@ -22,7 +23,8 @@
     "directory": "packages/powercontext"
   },
   "magpie": {
-    "gateway": "./powercontext.gateway.mjs",
+    "icon": "https://raw.githubusercontent.com/oceanbase/powercontext/master/src/powercontext/server/dashboard/static/brand/favicon-color.svg",
+    "hooks": "./powercontext.hooks.mjs",
     "options": {
       "authorizationEnv": "POWERCONTEXT_AUTHORIZATION",
       "gatewayTimeoutMs": 5000,
@@ -32,6 +34,11 @@
       "capture": false,
       "captureRemote": false,
       "recallRemote": false
+    },
+    "page": {
+      "title": "PowerContext",
+      "file": "page/settings.html",
+      "icon": "page/powercontext-favicon-color.svg"
     }
   },
   "scripts": {
