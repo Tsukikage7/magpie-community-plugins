@@ -29,8 +29,14 @@ const CHANNEL = "AutoClaw4";
 const CLIENT_VERSION = "1.18.1";
 const CN_CHANNEL = "AutoClaw26";
 const CN_CLIENT_VERSION = "2.1.0";
-const PLATFORM_TM = process.platform === "darwin" ? "mac" : process.platform === "win32" ? "win" : "linux";
-const USER_AGENT = `AutoClaw/${CLIENT_VERSION} (${PLATFORM_TM}-${process.arch})`;
+const PLATFORM = process.platform === "darwin" ? "mac" : process.platform === "win32" ? "win" : "linux";
+/** X-Tm: the official Linux client sends "linux-x64"; the overseas gateway
+ * answers the bare "linux" with 403 {"message":"forbidden"} (#367). */
+function platformTm(platform = process.platform) {
+  return platform === "darwin" ? "mac" : platform === "win32" ? "win" : "linux-x64";
+}
+const PLATFORM_TM = platformTm();
+const USER_AGENT = `AutoClaw/${CLIENT_VERSION} (${PLATFORM}-${process.arch})`;
 
 const GLOBAL_HOST = "https://autoglm-api.autoglm.ai";
 const CN_HOST = "https://autoglm-api.zhipuai.cn";
@@ -42,6 +48,12 @@ const OFFICIAL_SYSTEM_PROMPT = 'You are AutoClaw. Answer the user directly and c
 const WALLETS_PATH = `/agent-assetmgr/api/v2/wallets?biz_app_id=${PRODUCT}`;
 
 const FLAGGED = [
+  // Claude Code 2.1.30x opens with an SDK identity line, not the CLI one;
+  // the CN gateway refuses "Claude Agent SDK" in any case with 406. Take the
+  // trailing period and the article/possessive so the replacement reads as
+  // a sentence, not "assistant.." or "Anthropic's the agent framework".
+  [/You are a Claude agent, built on Anthropic's Claude Agent SDK\.?/gi, "You are a coding assistant."],
+  [/(?:Anthropic's |the )?Claude Agent SDK/gi, "the agent framework"],
   [/You are an AI agent powered by DeepSeek Harness/gi, "You are an AI agent powered by DeepSeek-Harness"],
   [/You are Claude Code/gi, "You are the Claude Code CLI"],
   [/You are Codex/gi, "You are the Codex agent"],
@@ -50,6 +62,8 @@ const FLAGGED = [
   [/You are Cursor/gi, "You are the Cursor agent"],
   [/You are Cline/gi, "You are the Cline agent"],
   [/You are Qwen Code/gi, "You are the Qwen Code agent"],
+  [/You are ZCode/gi, "You are the ZCode agent"],
+  [/operating inside pi, a coding agent harness/gi, "operating inside the pi coding agent harness"],
 ];
 
 function unflagged(text) {
@@ -82,7 +96,7 @@ function unflag(messages) {
 }
 
 const REFUSED_HINT =
-  "AutoClaw refuses chats whose system prompt carries another agent's identity line (Claude Code, Codex, opencode, Cursor, Cline, Qwen Code, DeepSeek Harness); this plugin rewrites the ones it knows, so an unknown one needs another provider in this group";
+  "AutoClaw refuses chats whose system prompt carries another agent's identity line (Claude Code, Claude Agent SDK, Codex, opencode, Cursor, Cline, Qwen Code, ZCode, pi, DeepSeek Harness); this plugin rewrites the ones it knows, so an unknown one needs another provider in this group";
 
 async function explained(res) {
   if (res.status < 400) return res;
@@ -101,6 +115,83 @@ async function explained(res) {
     JSON.stringify({ error: { message: `${said || "406 Not Acceptable"} — ${REFUSED_HINT}`, type: "permission_error", code: null } }),
     { status: res.status, statusText: res.statusText, headers },
   );
+}
+
+// A 403 is not always the sign-in: the CN managed gateway answers an
+// exhausted quota 403 {"code":810000,"message":"GLM-5.3 免费额度已用完,…"}
+// while the same token's next request with an unknown model gets as far as
+// "非法模型" (plugins#274). Such a refusal is the account's quota: it goes on
+// as a 429 with the gateway's own words, and the sign-in is kept.
+const QUOTA_CODES = new Set(["810000"]);
+const QUOTA_WORDS = /额度|余额不足|用完|用尽|quota|insufficient[_ ]?(balance|credit)|exhausted/i;
+
+/** said is the code and message of a parsed refusal body, read from its code/message fields only. */
+function said(d) {
+  if (!d || typeof d !== "object") return { code: null, message: "" };
+  return {
+    code: d.code ?? d.error?.code ?? null,
+    message: String(d.message ?? d.msg ?? d.error?.message ?? "").trim(),
+  };
+}
+
+/** quotaRefusal is a 403 chat answer read as a spent quota, or null when it isn't one (a 401 or any other 403 is still the sign-in). */
+async function quotaRefusal(res) {
+  if (res.status !== 403) return null;
+  const text = await res.clone().text().catch(() => "");
+  let d;
+  try { d = JSON.parse(text); } catch { return null; }
+  if (!d || typeof d !== "object") return null;
+  const { code, message } = said(d);
+  if (!QUOTA_CODES.has(String(code)) && !(message && QUOTA_WORDS.test(message))) return null;
+  try { res.body?.cancel?.(); } catch {}
+  return new Response(JSON.stringify({ error: { message: `AutoClaw: ${message || "quota exhausted"}`, type: "rate_limit_error", code } }), {
+    status: 429,
+    headers: { "Content-Type": "application/json", "X-Magpie-Sign-In": "kept" },
+  });
+}
+
+// A 403 can be the account itself: a banned AutoClaw account answers
+// HTTP 403 {"code":410004,"message":"The account has been banned"} on every
+// route (小八, Discord 2026-10-23). That is no expired sign-in: signing in
+// again gets the same account and the same refusal, and reading it as
+// expired made magpie drop the token while the user never saw why. It goes
+// on as a 403 with the vendor's words, and the sign-in is kept. Only the
+// body's code or message field is read, never the whole body.
+const BANNED_CODES = new Set(["410004"]);
+const BANNED_WORDS = /\bbanned\b|封禁|封号|账号异常|账户异常|account (has been |is |was )?(suspended|frozen|disabled|blocked|restricted)|账[号户](已|已被|被)?(冻结|停用|禁用)/i;
+
+/** bannedSaid is the vendor's words when a parsed body is an account-level refusal (a ban), or "" when it isn't one. */
+function bannedSaid(d) {
+  const { code, message } = said(d);
+  if (BANNED_CODES.has(String(code))) return message || `account refused (code ${code})`;
+  return message && BANNED_WORDS.test(message) ? message : "";
+}
+
+/** bannedText is bannedSaid over a raw body text. */
+function bannedText(text) {
+  let d;
+  try { d = JSON.parse(text); } catch { return ""; }
+  return bannedSaid(d);
+}
+
+/** accountRefusal is a 401/403 chat answer read as the account refused (banned), or null when it isn't one. */
+async function accountRefusal(res) {
+  if (res.status !== 401 && res.status !== 403) return null;
+  const text = await res.clone().text().catch(() => "");
+  const message = bannedText(text);
+  if (!message) return null;
+  let code = null;
+  try { code = said(JSON.parse(text)).code; } catch {}
+  try { res.body?.cancel?.(); } catch {}
+  return new Response(JSON.stringify({ error: { message: `AutoClaw: ${message}`, type: "permission_error", code } }), {
+    status: 403,
+    headers: { "Content-Type": "application/json", "X-Magpie-Sign-In": "kept" },
+  });
+}
+
+/** refusedNotSignIn is a 401/403 that is the account's (quota or ban), not its sign-in, or null. */
+async function refusedNotSignIn(res) {
+  return (await quotaRefusal(res)) ?? (await accountRefusal(res));
 }
 
 function autoclawRewriteBody(rawBody) {
@@ -260,12 +351,15 @@ async function callEnvelope(path, { method = "GET", body, base }) {
   let parsed;
   try { parsed = text ? JSON.parse(text) : undefined; } catch { parsed = undefined; }
   if (!parsed || (parsed.code === undefined && response.status >= 400)) {
-    const err = new Error(`AutoClaw ${path.split("?")[0]} non-envelope response (HTTP ${response.status}): ${text.slice(0, 200)}`);
-    // 401/403 不论响应体形态都是登录失效：挂上标记，宿主才会提示重新登录
-    if (response.status === 401 || response.status === 403) err.signIn = "expired";
+    const banned = bannedSaid(parsed);
+    const err = new Error(banned
+      ? `AutoClaw: ${banned}`
+      : `AutoClaw ${path.split("?")[0]} non-envelope response (HTTP ${response.status}): ${text.slice(0, 200)}`);
+    // 401/403 不论响应体形态都是登录失效（账号被封除外：那是账号，不是登录）
+    if (response.status === 401 || response.status === 403) err.signIn = banned ? "kept" : "expired";
     throw err;
   }
-  return { status: response.status, code: parsed.code, msg: parsed.msg, data: parsed.data };
+  return { status: response.status, code: parsed.code, msg: parsed.msg ?? parsed.message, data: parsed.data, banned: bannedSaid(parsed) };
 }
 
 /** 验证码必须按数字发送（服务端按类型校验，字符串 → 400001）。 */
@@ -303,9 +397,17 @@ async function fetchWallets(accessToken, hosts) {
         redirect: "error",
         signal: AbortSignal.timeout(20_000),
       });
-      if (!res.ok) continue;
+      if (!res.ok) {
+        // a banned account is so on every host: say it instead of "no data"
+        const banned = (res.status === 401 || res.status === 403) ? bannedText(await res.text().catch(() => "")) : "";
+        if (banned) throw Object.assign(new Error(`AutoClaw: ${banned}`), { banned: true });
+        continue;
+      }
       payload = await res.json();
-    } catch { continue; }
+    } catch (e) {
+      if (e?.banned) throw e;
+      continue;
+    }
     if (!payload || payload.code !== 0 || !payload.data) continue;
     return payload.data;
   }
@@ -336,6 +438,8 @@ async function taskList(accessToken, host) {
     signal: AbortSignal.timeout(15_000),
   });
   if (res.status === 401 || res.status === 403) {
+    const banned = bannedText(await res.text().catch(() => ""));
+    if (banned) throw Object.assign(new Error(`AutoClaw: ${banned}`), { banned: true, signIn: "kept" });
     throw new Error(`登录已失效（HTTP ${res.status}）`);
   }
   if (!res.ok) return null;
@@ -378,6 +482,18 @@ function checkinOutcome(r) {
 
 /** 本地去重键（成功才记；按小时允许重试）。 */
 const signinTriedLocal = new Map(); // key → hour-stamp of last SUCCESSFUL signin
+
+/**
+ * 补签去重键：每个登录一个（#254）。显示名可以重复（AutoClaw 默认昵称改不了），
+ * 所以按 uid，没有 uid 的旧账号按 refresh token 的哈希；只用供应商 id 会让
+ * 同一供应商下的第二个账号当天永远不补签。
+ */
+function signinAccountKey(providerId, auth) {
+  const uid = String(auth?.uid ?? "").trim();
+  if (uid) return `${providerId}|uid:${uid}`;
+  const tok = bareToken(String(auth?.refresh ?? auth?.access ?? ""));
+  return `${providerId}|tok:${createHash("sha256").update(tok).digest("hex").slice(0, 16)}`;
+}
 
 /**
  * 签到配置合并：插件 options（plugins.json 的 options 字段）优先，
@@ -423,13 +539,28 @@ async function maybeSignin(accessToken, host, options, reason, accountKey) {
 // 用户资料（GUI 账户命名：昵称/手机号，替代无意义的 uid 哈希 → 「已登录」）
 // ---------------------------------------------------------------------------
 
+/**
+ * 账号自己的 device_id：登录时生成并随登录请求发出的那个，服务端写进了 token 的 device_id claim。
+ * 官方 AutoClaw（1.18.5 getUserInfoWithAccessToken → withWebInfo）在 user-profile 里发的就是
+ * 登录用的设备 id（getAuthState().deviceId），不是固定串。
+ */
+function accountDeviceId(deviceId, ...tokens) {
+  const given = nonEmptyString(deviceId);
+  if (given) return given;
+  for (const t of tokens) {
+    const claim = nonEmptyString(jwtClaim(t, "device_id"));
+    if (claim) return claim;
+  }
+  return "";
+}
+
 /** POST /userapi/v1/user-profile → { user_name, user_phone, user_id, … }；失败返回 null。 */
-async function fetchUserProfile(accessToken, base) {
+async function fetchUserProfile(accessToken, base, deviceId, refreshToken) {
   try {
     const res = await fetch(`${base}/userapi/v1/user-profile`, {
       method: "POST",
       headers: bizHeaders(accessToken),
-      body: JSON.stringify({ source_id: PRODUCT, device_id: "magpie-plugin" }),
+      body: JSON.stringify({ source_id: PRODUCT, device_id: accountDeviceId(deviceId, accessToken, refreshToken) }),
       signal: AbortSignal.timeout(15_000),
     });
     if (!res.ok) return null;
@@ -474,6 +605,8 @@ async function refreshTokens(refreshToken, preferredHosts) {
   }
   if (!result) throw new Error("AutoClaw refresh: no host attempted");
   if (result.code !== 0 || !result.data) {
+    // a banned account is refused, not signed out: the sign-in is kept
+    if (result.banned) throw Object.assign(new Error(`AutoClaw: ${result.banned}`), { signIn: "kept" });
     const dead = result.status === 401 || result.status === 403
       || /invalid[_ ]?grant|revoked|expired|登录已失效|token 失效/i.test(String(result.msg ?? ""));
     const err = new Error(`AutoClaw token refresh failed (HTTP ${result.status}): ${result.msg ?? `code ${result.code}`}`);
@@ -492,7 +625,7 @@ function managedHeaders(token, model) {
   const rid = randomHex(16);
   const headers = new Headers(bizHeaders());
   headers.set("Accept", "application/json");
-  headers.set("User-Agent", `AutoClaw/${CN_CLIENT_VERSION} (${PLATFORM_TM}-${process.arch})`);
+  headers.set("User-Agent", `AutoClaw/${CN_CLIENT_VERSION} (${PLATFORM}-${process.arch})`);
   headers.set("X-Channel", CN_CHANNEL);
   headers.set("X-Version", CN_CLIENT_VERSION);
   headers.set("X-Trace-Id", rid);
@@ -547,12 +680,12 @@ function makeAutoclawPlugin({ providerId, providerName, homeHost, loginMethod })
 
       async refresh(auth) {
         const t = await refreshTokens(bareToken(auth.refresh), [homeHost]);
-        await maybeSignin(t.access, homeHost, options, "refresh", providerId);
+        await maybeSignin(t.access, homeHost, options, "refresh", signinAccountKey(providerId, auth));
         // 存量账号就地正名：登录响应缺昵称的旧账号（GUI 显示「已登录」），
         // 刷新时补拉 user-profile。magpie 的 refresh 返回字段会合并进账号。
         const old = String(auth.accountId ?? auth.email ?? "");
         if (!old || /^(已登录|[0-9a-f]{24,})$/.test(old)) {
-          const profile = await fetchUserProfile(t.access, homeHost);
+          const profile = await fetchUserProfile(t.access, homeHost, jwtClaim(bareToken(auth.refresh), "device_id"), t.refresh);
           const name = accountDisplayName(profile, "");
           if (name) {
             t.accountId = name;
@@ -573,6 +706,8 @@ function makeAutoclawPlugin({ providerId, providerName, homeHost, loginMethod })
           async fetch(input, init) {
             if (providerId !== "autoclaw-cn") {
               const headers = new Headers(init?.headers);
+              // magpie's own hint headers (x-magpie-*) are for the plugin, never the vendor
+              for (const k of [...headers.keys()]) if (k.toLowerCase().startsWith("x-magpie-")) headers.delete(k);
               headers.set("User-Agent", USER_AGENT);
               headers.set("X-Authorization", `Bearer ${accessToken}`);
               headers.set("X-Client-Type", "pc");
@@ -605,7 +740,13 @@ function makeAutoclawPlugin({ providerId, providerName, homeHost, loginMethod })
 
               const res1 = await tryFetch(hosts[0]);
               if (res1.status !== 401 && res1.status !== 403) return explained(res1);
+              // a spent quota or a ban is the account's on every host: not asked again
+              const spent1 = await refusedNotSignIn(res1);
+              if (spent1) return spent1;
+              try { res1.body?.cancel?.(); } catch {}
               const res2 = await tryFetch(hosts[1]);
+              const spent2 = await refusedNotSignIn(res2);
+              if (spent2) return spent2;
               if (res2.status === 401 || res2.status === 403) {
                 try { res2.body?.cancel?.(); } catch {}
                 return new Response(JSON.stringify({ error: { message: "AutoClaw 登录已失效（两个 host 均拒绝该 token）", type: "invalid_request_error" } }), {
@@ -626,7 +767,9 @@ function makeAutoclawPlugin({ providerId, providerName, homeHost, loginMethod })
               headers,
               body: JSON.stringify(payload),
             });
-            if (res.status !== 401 && res.status !== 403) return res;
+            if (res.status !== 401 && res.status !== 403) return explained(res);
+            const spent = await refusedNotSignIn(res);
+            if (spent) return spent;
             try { res.body?.cancel?.(); } catch {}
             return new Response(JSON.stringify({ error: { message: "AutoClaw 登录已失效", type: "invalid_request_error" } }), {
               status: 401,
@@ -650,7 +793,7 @@ function makeAutoclawPlugin({ providerId, providerName, homeHost, loginMethod })
           // 旧链路自动补签（默认关，需 signinOnUsage=true）：查额度即触发。
           // 放在状态查询之后：未签才补，补完重查一次状态展示。
           if (signin && signin.status !== "completed" && (cfg.signin && cfg.signinOnUsage)) {
-            await maybeSignin(token, hosts[0], options, "usage", providerId);
+            await maybeSignin(token, hosts[0], options, "usage", signinAccountKey(providerId, auth));
           }
           const signinFinal = signin?.status === "completed"
             ? signin
@@ -679,15 +822,16 @@ function makeAutoclawPlugin({ providerId, providerName, homeHost, loginMethod })
               }]
             : [];
 
+          // 积分是纯余额，没有总量也没有已用量：只放在 balance 里。做成
+          // used: 0 的窗口，卡片会给它配上「剩余 100%」（#376）。细分钱包
+          // 一并写进 balance。
+          const parts = named.map((w) => `${w.name} ${Math.round(w.balance)}`);
           return {
-            balance: `${Math.round(total)} 积分`,
-            windows: [
-              { name: "积分余额", used: 0, display: `${Math.round(total)} 积分`, aside: true },
-              ...signinWindow,
-              ...named.map((w) => ({ name: w.name, used: 0, display: `${Math.round(w.balance)}`, aside: true })),
-            ],
+            balance: `${Math.round(total)} 积分${parts.length ? `（${parts.join(" · ")}）` : ""}`,
+            windows: signinWindow,
           };
         } catch (e) {
+          if (e?.banned) return { error: e.message, signIn: "kept", windows: [] };
           return { error: `积分查询失败: ${e?.message ?? e}`, windows: [] };
         }
       },
@@ -713,7 +857,10 @@ function makeAutoclawPlugin({ providerId, providerName, homeHost, loginMethod })
               task = tasks.find((x) => x?.task_id === "daily_signin") ?? null;
               break;
             }
-          } catch (e) { lastErr = e; }
+          } catch (e) {
+            lastErr = e;
+            if (e?.banned) break;
+          }
         }
         if (!task && lastErr) throw lastErr;
         if (!task) return { outcome: "inactive", message: "当前没有签到活动" };
@@ -774,7 +921,7 @@ const phoneSmsMethod = {
         }
         const t = tokenFields(res.data);
         // GUI 显示名：拉 user-profile 取昵称/手机号（登录响应的 user_name 常为空 → 显示「已登录」）
-        const profile = await fetchUserProfile(t.access, CN_HOST);
+        const profile = await fetchUserProfile(t.access, CN_HOST, deviceId);
         const displayName = accountDisplayName(profile, phone);
         return {
           type: "success",
@@ -1031,7 +1178,7 @@ async function startLocalOAuth(vendor, openFn) {
         }
         const t = tokenFields(res.data);
         // GUI 显示名：拉 user-profile 取昵称（Google/z.ai 账号通常有昵称或邮箱）
-        const profile = await fetchUserProfile(t.access, GLOBAL_HOST);
+        const profile = await fetchUserProfile(t.access, GLOBAL_HOST, deviceId);
         const displayName = accountDisplayName(profile, `${vendor} 账号`);
         return {
           type: "success",
@@ -1199,10 +1346,11 @@ export const AutoclawCnAuthPlugin = makeAutoclawPlugin({
 
 /** 测试辅助（magpie/OpenCode 不会把它当插件调用）。 */
 export const _internal = {
+  quotaRefusal, accountRefusal, bannedSaid,
   makePluginForTest: makeAutoclawPlugin,
-  md5Hex, jwtClaim, tokenFields, codeValue, bizHeaders, bareToken, newDeviceId,
-  dailySignin, signinStatus, maybeSignin, signinConfig, checkinOutcome, refreshTokens,
-  fetchUserProfile, accountDisplayName, startLocalOAuth,
+  platformTm, md5Hex, jwtClaim, tokenFields, codeValue, bizHeaders, bareToken, newDeviceId,
+  dailySignin, signinStatus, maybeSignin, signinAccountKey, signinConfig, checkinOutcome, refreshTokens,
+  fetchUserProfile, accountDeviceId, accountDisplayName, startLocalOAuth,
   FLAGGED, unflagged, unflag, autoclawRewriteBody, explained, OFFICIAL_SYSTEM_PROMPT, REFUSED_HINT,
   guidePageHtml, callbackPageHtml,
 };

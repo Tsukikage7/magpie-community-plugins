@@ -68,6 +68,9 @@ const SITES = {
     platform: "workbuddy",
     ai: false,
     models: CN_MODELS,
+    // it serves the Claude models on Anthropic's Messages API too (see
+    // nativeOf)
+    messages: true,
   },
   "workbuddy-ai": {
     id: "workbuddy-ai",
@@ -102,6 +105,33 @@ const NPM = "@ai-sdk/openai-compatible"
 const hex = () => randomBytes(16).toString("hex")
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const api = (site) => site.endpoint + "/v2"
+
+// MESSAGES is the API SDK package for Anthropic's Messages shape, which
+// WorkBuddy serves the Claude models on, beside its chat completions:
+// <endpoint>/v1/messages. Those models are Anthropic's own, and their
+// thinking is asked for the way Anthropic asks it (thinking.type adaptive
+// with output_config.effort), which the chat endpoint has no field for: a
+// chat carries reasoning_effort alone, and WorkBuddy's chat endpoint gives
+// the same answer at every level, so an agent that picked max got no more
+// than one that picked low. See nativeOf.
+const NPM_MESSAGES = "@ai-sdk/anthropic"
+const apiMessages = (site) => site.endpoint + "/v1"
+
+// nativeOf is whether site serves model on Messages rather than chat: a
+// Claude model, on a site that serves Messages at all (site.messages).
+// Measured 2026-10-24 on WorkBuddy's China build, each model of
+// /v3/config's cli agent asked on /v1/messages: claude-opus-5.5,
+// claude-sonnet-5.5, claude-opus-5 and claude-opus-4.8-1m answered in
+// Anthropic's stream; glm-5.3 and deepseek-v4.1-flash answered 500, gpt-5.5
+// and kimi-k3-1 400. An account may still be refused a Claude model it has
+// no entitlement for (11158), which is the account's, not the endpoint's.
+// WorkBuddy AI (www.workbuddy.ai) has no such route: /v1/messages,
+// /v2/messages and /v1/messages?beta=true are all "404 Route Not Found"
+// there, whatever the model, so its models stay on chat, a Claude one too
+// should it list one.
+function nativeOf(site, model) {
+  return site?.messages === true && /^claude-/i.test(String(model ?? ""))
+}
 
 // ---- WorkBuddy's API ------------------------------------------------------
 
@@ -370,11 +400,32 @@ function signatureOf(content) {
 // words. A client that sends a tool result's images in a user message (pi's
 // "Attached image(s) from tool result:") puts that message right after the
 // result, and a turn keyed on it would be a turn of its own on every step.
+//
+// Anthropic's Messages shape says the same another way: a tool's result is a
+// tool_result block in a user message, after an assistant message of
+// tool_use blocks. Such a user message answers too, whatever text sits
+// beside the results (Claude Code puts a reminder there, a user's words typed
+// mid-task go there as well), and so does one right after it, as a chat's
+// does after role "tool". Messages that are neither the user's nor the
+// assistant's (Claude Code's role "system" ones, which carry a turn's
+// effort, its environment and its token count between the steps) stand
+// between them without changing which message answers.
 function answeredBefore(msgs, i) {
-  const prev = msgs[i - 1]
+  if (hasBlock(msgs[i], "tool_result")) return true
+  let j = i - 1
+  while (j >= 0 && msgs[j]?.role === "system") j--
+  const prev = msgs[j]
   if (prev === null || typeof prev !== "object") return false
   if (prev.role === "tool") return true
-  return prev.role === "assistant" && Array.isArray(prev.tool_calls) && prev.tool_calls.length > 0
+  if (prev.role === "user" && hasBlock(prev, "tool_result")) return true
+  if (prev.role !== "assistant") return false
+  if (Array.isArray(prev.tool_calls) && prev.tool_calls.length > 0) return true
+  return hasBlock(prev, "tool_use")
+}
+
+// hasBlock is whether message m's content holds a block of type.
+function hasBlock(m, type) {
+  return Array.isArray(m?.content) && m.content.some((p) => p?.type === type)
 }
 
 // turnKey names the user send a chat answers: the body's last user message
@@ -408,6 +459,100 @@ function conversationKey(chat, session) {
     if (sig) return `first:${sig}`
   }
   return ""
+}
+
+// isMessages says whether a request is an Anthropic Messages one, which
+// site serves the Claude models natively: its URL ends at /messages or at
+// the counting endpoint beside it (/v1/messages/count_tokens, which the
+// chat route's rewrites would otherwise turn into a chat), or (a body is
+// all there is to go on) its system is Anthropic's blocks rather than a
+// chat's string, and its tools carry input_schema where a chat's carry a
+// function's parameters. A chat's own tools can look either way, so the URL
+// decides when there is one.
+function isMessages(url, body) {
+  const path = (() => {
+    try {
+      return new URL(String(url ?? "")).pathname
+    } catch {
+      return ""
+    }
+  })()
+  if (path) return /\/messages(\/count_tokens)?$/.test(path)
+  const b = chatOf(body)
+  if (!b) return false
+  if (Array.isArray(b.system)) return true
+  const tools = Array.isArray(b.tools) ? b.tools : []
+  return tools.some((t) => t && typeof t === "object" && "input_schema" in t && !t.function)
+}
+
+// withoutUnsigned is a Messages body without the thinking blocks that carry
+// no signature, or whose signature WorkBuddy doesn't take.
+//
+// A conversation that began elsewhere — on WorkBuddy's chat route, whose
+// thinking comes back unsigned, or on any other provider — and goes on here
+// carries such blocks in its history, and WorkBuddy refuses the whole request
+// for one of them when another assistant message holds a signed block:
+// 11159 "Invalid `signature` in `thinking` block. The block is bound to a
+// different conversation" (or the same wrapped in 11133). Seen 2026-10-24 in
+// real Claude Code sessions moved onto this route mid-way: every request of
+// two of them refused, each attempt alike, until the session ended. Replayed
+// the same day, with a real account (20+ runs each):
+//
+//   unsigned thinking alone, no signed block anywhere ....... 200
+//   one unsigned-only assistant message + a signed one ...... 11159
+//   that message with the unsigned block taken out .......... 200
+//   unsigned and signed blocks in the SAME message .......... 200
+//   thinking.block_binding.prefix_mismatch_behavior=drop_block ... 11159
+//
+// So what binds a signed block is the history it sits in, and a message that
+// is thinking alone can't be part of it; whether that thinking is signed
+// makes no difference (a signed block alone is accepted too). The signature
+// itself isn't checked for where it came from: a block keeping a signature
+// of an unrelated turn, of another model (sonnet-5.5's on opus-5.5), or
+// another account's answers 200, while a truncated or altered one is 11159.
+// What WorkBuddy checks is that it reads as a signature.
+//
+// A block with no signature can't be verified by the model anyway, so
+// nothing it could use is lost. A message whose only block that was gets an
+// empty text block: measured the same day, that history still answers 200
+// with a signed turn after it (three runs), where the unsigned block itself
+// answers 11159 (three runs), and Anthropic's API refuses an empty text
+// block — 200 here means WorkBuddy takes it. The signed blocks, this
+// route's own, go back as they came, as Anthropic asks. A body without
+// unsigned thinking is body itself, byte for byte.
+function withoutUnsigned(body) {
+  const b = chatOf(body)
+  const msgs = b?.messages
+  if (!Array.isArray(msgs)) return body
+  let changed = false
+  for (const m of msgs) {
+    if (m?.role !== "assistant" || !Array.isArray(m.content)) continue
+    const kept = m.content.filter((p) => !(p?.type === "thinking" && !p.signature))
+    if (kept.length === m.content.length) continue
+    changed = true
+    m.content = kept.length ? kept : [{ type: "text", text: "" }]
+  }
+  return changed ? JSON.stringify(b) : body
+}
+
+// withoutSignedThinking is a Messages body without any thinking block at
+// all, for a refusal saying a signature is not one WorkBuddy made (see the
+// retry in the loader). An assistant message left with nothing gets an
+// empty text block, as withoutUnsigned leaves it. null for a body with no
+// thinking block to drop: the retry would send the same request again.
+function withoutSignedThinking(body) {
+  const b = chatOf(body)
+  const msgs = b?.messages
+  if (!Array.isArray(msgs)) return null
+  let dropped = 0
+  for (const m of msgs) {
+    if (m?.role !== "assistant" || !Array.isArray(m.content)) continue
+    const kept = m.content.filter((p) => p?.type !== "thinking")
+    if (kept.length === m.content.length) continue
+    dropped += m.content.length - kept.length
+    m.content = kept.length ? kept : [{ type: "text", text: "" }]
+  }
+  return dropped ? JSON.stringify(b) : null
 }
 
 // chatOf is a chat's body as the object it is, null for one that isn't: a
@@ -463,6 +608,15 @@ const FLAGGED = [
   [/You are Claude Code, Anthropic['’]s official CLI for Claude/gi, "You are Claude Code, Anthropic's CLI for Claude"],
   [/Main branch \(you will usually use this for PRs\)/gi, "Main branch (usually the base for PRs)"],
   [/(?<!the )Codex CLI is an open source project led by OpenAI\./gi, "The Codex CLI is an open source project led by OpenAI."],
+  // DeepSeek Harness (DSH) opens its system prompt with this line, which
+  // WorkBuddy refuses as 11128 (magpie-community/plugins#279; the same
+  // refusal traced in smart-open/TraeWorkAssistant#125).
+  [/You are an AI agent powered by DeepSeek Harness\.?/gi, "You are an AI agent that helps the user with programming tasks."],
+  // A line WorkBuddy refuses in a long DeepSeek Harness chat, measured 400
+  // then 200 with this wording by tearslee (magpie-community/plugins#291). The
+  // model can quote it back into an assistant message, which the move to
+  // the user's instructions can't reach, so it is reworded in every message.
+  [/Web GUI whose URL the runtime context names\.\s+When the user refers/gi, "Web GUI whose URL the runtime context names. The interface, when the user refers"],
 ]
 
 function unflagged(text) {
@@ -536,6 +690,61 @@ function withSystem(body) {
   } catch {
     return body
   }
+}
+
+// WorkBuddy's channel check reads the system and assistant messages only:
+// tried on 2026-10-21 with real accounts on both builds (glm-5.3,
+// deepseek-v4.1-flash, gpt-5.5), each refused line was served in the user's
+// message, a tool's result and a user message's parts, and refused again in
+// the system or an assistant message. It matches a known line whole and
+// exactly (one extra space lets it through), so FLAGGED only ever knows the
+// lines met so far, and another agent's opening line is refused until one is
+// added (Wing on Discord, 10-21, with an agent we couldn't name).
+//
+// systemAsUser is body with its system prompt read to the model as the
+// first thing the user says, in INSTRUCTIONS' tags, and WorkBuddy's default
+// system prompt first, as both builds want a system message there (11128
+// "first message is not system prompt"). A system message later in the chat
+// becomes the user's where it stands. null when there's nothing to move.
+const DEFAULT_SYSTEM = "You are a helpful assistant."
+const INSTRUCTIONS = ["<instructions>\n", "\n</instructions>"]
+
+function textOf(content) {
+  if (typeof content === "string") return content
+  if (!Array.isArray(content)) return ""
+  return content.map((p) => (typeof p?.text === "string" ? p.text : "")).filter(Boolean).join("\n")
+}
+
+// systemKey is the text of a chat's system messages, which a chat refused
+// once is known by: the same agent's next chat goes with systemAsUser at once
+function systemKey(body) {
+  const msgs = chatOf(body)?.messages
+  if (!Array.isArray(msgs)) return ""
+  const key = msgs.filter((m) => m?.role === "system").map((m) => textOf(m.content)).join("\n")
+  return key.trim() === DEFAULT_SYSTEM ? "" : key
+}
+
+function systemAsUser(body) {
+  const b = chatOf(body)
+  const msgs = b?.messages
+  if (!Array.isArray(msgs)) return null
+  let i = 0
+  const lead = []
+  for (; i < msgs.length && msgs[i]?.role === "system"; i++) lead.push(textOf(msgs[i].content))
+  const said = lead.join("\n\n").trim()
+  const rest = msgs.slice(i).map((m) => (m?.role === "system" ? { ...m, role: "user" } : m))
+  const moved = said && said !== DEFAULT_SYSTEM
+  if (!moved && rest.every((m, k) => m === msgs[i + k])) return null
+  if (moved) {
+    const text = INSTRUCTIONS[0] + said + INSTRUCTIONS[1]
+    const u = rest.findIndex((m) => m?.role === "user")
+    if (u < 0) rest.unshift({ role: "user", content: text })
+    else if (typeof rest[u].content === "string") rest[u] = { ...rest[u], content: text + "\n\n" + rest[u].content }
+    else if (Array.isArray(rest[u].content)) rest[u] = { ...rest[u], content: [{ type: "text", text }, ...rest[u].content] }
+    else rest[u] = { ...rest[u], content: text }
+  }
+  b.messages = [{ role: "system", content: DEFAULT_SYSTEM }, ...rest]
+  return JSON.stringify(b)
 }
 
 // normalizeToolChoice converts the object form emitted by OpenAI clients to
@@ -830,6 +1039,41 @@ function objectRoot(ps, root = ps, depth = 0) {
   return true
 }
 
+// Kimi (kimi-k3.1-pro) answers 400 "Invalid request parameters" to a oneOf
+// that has no type, at the root of a $ref's target or deeper, even when every
+// branch is an object (congee949, #378: dsh's REA tools, on workbuddy and
+// workbuddy-ai alike; a "type": "object" beside it is taken). typeUnions gives
+// such a oneOf type "object" when each branch is typed object itself or
+// through a chain of local $refs, and changes nothing else: a union of other
+// or mixed types, an anyOf, or a $ref that is missing, external or circular
+// is left as it came. It reports whether it changed anything.
+function typeUnions(s, root = s, depth = 0) {
+  if (!s || typeof s !== "object" || Array.isArray(s) || depth > 64) return false
+  let changed = false
+  if (!("type" in s) && Array.isArray(s.oneOf) && s.oneOf.length && s.oneOf.every((b) => objectBranch(root, b))) {
+    s.type = "object"
+    changed = true
+  }
+  for (const k of SUB_ONE) if (typeUnions(s[k], root, depth + 1)) changed = true
+  for (const k of SUB_LIST) for (const v of Array.isArray(s[k]) ? s[k] : []) if (typeUnions(v, root, depth + 1)) changed = true
+  for (const k of SUB_MAP) {
+    const m = s[k]
+    if (!m || typeof m !== "object" || Array.isArray(m)) continue
+    for (const v of Object.values(m)) if (typeUnions(v, root, depth + 1)) changed = true
+  }
+  return changed
+}
+
+// objectBranch says whether b is typed object, itself or where its local
+// $refs lead; a $ref seen before on the way is a cycle, and not.
+function objectBranch(root, b, seen = []) {
+  if (!b || typeof b !== "object" || Array.isArray(b)) return false
+  if ("type" in b) return b.type === "object"
+  if (typeof b.$ref !== "string" || seen.includes(b.$ref) || seen.length > 16) return false
+  const t = localRef(root, b)
+  return t !== b && objectBranch(root, t, [...seen, b.$ref])
+}
+
 // fitTools mends b's function tools in place: their parameters (fitSchema,
 // fitShape, objectRoot) and names. It reports whether it changed anything,
 // and the names it gave, each to the name the client knows (ours), so that the
@@ -863,6 +1107,7 @@ function fitTools(b) {
     }
     if (fitSchema(fn.parameters)) changed = true
     if (fitShape(fn.parameters)) changed = true
+    if (typeUnions(fn.parameters)) changed = true
     if (objectRoot(fn.parameters)) changed = true
   }
   if (theirs.size && Array.isArray(b.messages)) {
@@ -1059,6 +1304,8 @@ function readDesktop(site) {
       uid: acct.uid,
       ...(typeof acct.enterpriseId === "string" && acct.enterpriseId.trim() ? { enterpriseId: acct.enterpriseId.trim() } : {}),
       name: acct.nickname || acct.phoneNumber || acct.uid,
+      // what the errors below say to do goes by it: sign in to the app again
+      source: "desktop",
     }
   } catch {
     return null
@@ -1173,23 +1420,143 @@ async function unanswered(site, a, body, err, signal) {
   const size = byteLength(body)
   if (size <= EDGE_READS) throw err
   let status = 0
+  let challenge = ""
   try {
     const res = await meterAsked(site, a, "/billing/meter/get-user-resource-summary", {}, AbortSignal.timeout(20000))
     status = res.status
+    challenge = res.headers.get("www-authenticate") ?? ""
     await res.body?.cancel()
   } catch {
     throw err
   }
   if (status !== 401) throw err
   const mb = (size / (1024 * 1024)).toFixed(1)
+  const note = `It closes the connection on a refused request over 2 MiB (this one was ${mb} MiB) instead of answering, which is why it read as ECONNRESET.`
   const message =
-    `${site.name} refused this account's sign-in (401). It closes the connection on a refused request over 2 MiB ` +
-    `(this one was ${mb} MiB) instead of answering, which is why it read as ECONNRESET. ` +
+    `${site.name} refused this account's sign-in (401). ${note} ` +
     (a.source === "desktop" ? `Sign in to ${site.name} desktop again.` : `Sign in to ${site.name} again in magpie.`)
+  // the billing API's challenge goes with it: it says whether the token
+  // itself was refused (invalidToken), as the chat's own 401 would have
+  const headers = { "content-type": "application/json", ...(challenge ? { "www-authenticate": challenge } : {}) }
+  const res = new Response(JSON.stringify({ error: { message, type: "authentication_error", code: 401 } }), {
+    status: 401,
+    statusText: "Unauthorized",
+    headers,
+  })
+  edgeNotes.set(res, note)
+  return res
+}
+
+// edgeNotes is what unanswered's 401s say of the reset, for signedOut to
+// say again when the sign-in can't be renewed.
+const edgeNotes = new WeakMap()
+
+// ---- a refused sign-in ----------------------------------------------------------
+
+// invalidToken says res is WorkBuddy refusing the access token itself. Its
+// front door (APISIX, on both sites) answers a token it doesn't take with
+// 401 and WWW-Authenticate: Bearer realm="copilot", error="invalid_token",
+// on a chat (streamed or not) and on the billing API alike; measured on
+// www.workbuddy.ai on 2026-10-23 with a real account's token cut short,
+// and with "garbage". (Its /v3/config answers 200 to any token, so the
+// models list never meets a 401.) A 401 without it is not taken as the
+// sign-in's: WorkBuddy answers some paths with a bare 401 to an accepted
+// sign-in (magpie's check-in, モモコ on Discord).
+const invalidToken = (res) => res?.status === 401 && /invalid_token/i.test(res.headers.get("www-authenticate") ?? "")
+
+// refreshRefused says e is WorkBuddy turning the refresh token itself
+// away: HTTP 401 with code 12153, "refresh token failed:400 Bad Request:
+// invalid_grant: Invalid refresh token" for a spent or unknown one, or
+// "10000:token format error" (measured 2026-10-23). Anything else (a 5xx,
+// a timeout) says nothing of the sign-in.
+const refreshRefused = (e) => e instanceof WBError && (e.status === 401 || /invalid_grant/i.test(e.message))
+
+// reissued is the sign-in to send a request WorkBuddy refused a's access
+// token for (401) once more with, before that token's time: WorkBuddy can
+// refuse one long before it ends (a browser sign-in's lasts as long as
+// its refresh token, about 340 days), and renewing only by time left such
+// an account refused on every request for months. It is
+//   { a }: a sign-in with another access token, to send the request with
+//     once more;
+//   { why, kind }: none to be had, why, and of what kind: "refresh
+//     refused" (WorkBuddy turned the refresh token away too), "nothing to
+//     renew with" (no refresh token, or one past its end), or "unknown"
+//     (the refresh failed for another reason, the desktop's token is the
+//     one refused).
+// began is the access token the request read at its start: a stored one
+// that isn't it was saved since by someone else (magpie's renewal,
+// another of its processes), and is taken rather than renewing again.
+//
+// A desktop sign-in is the app's: its file is read again, and what was
+// renewed here (desktopHeld) is let go, but its refresh token is never
+// spent for a refusal, which would sign the app itself out (see
+// desktopSignIn).
+async function reissued(site, client, getAuth, a, began) {
+  if (a.source === "desktop") {
+    desktopHeld.delete(site.id + "|" + a.uid)
+    const d = readDesktop(site)
+    if (!d) return { why: notDesktop(site), kind: "unknown" }
+    if (d.access !== a.access) {
+      desktopHeld.set(site.id + "|" + d.uid, d)
+      return { a: d }
+    }
+    return { why: `${site.name} desktop's own sign-in is the one refused`, kind: "unknown" }
+  }
+  const newer = async () => {
+    const now = await getAuth().catch(() => null)
+    return now?.type === "oauth" && now.source !== "desktop" && now.access && now.access !== began && now.access !== a.access ? now : null
+  }
+  const saved = await newer()
+  if (saved) return { a: saved }
+  if (!refreshable(a)) return { why: a.refresh ? "its refresh token has ended" : "there is no refresh token to renew it with", kind: "nothing to renew with" }
+  try {
+    const next = await renew(site, a, async (n) => {
+      try {
+        await client?.auth?.set?.({ path: { id: site.id }, body: n })
+      } catch {}
+    })
+    return next.access !== a.access ? { a: next } : { why: "renewing it gave the same token", kind: "unknown" }
+  } catch (e) {
+    if (refreshRefused(e)) {
+      // spent by someone else, who saved what it gave
+      const saved = await newer()
+      if (saved) return { a: saved }
+      return { why: `it refused the refresh token too (${e.said ?? e.message})`, kind: "refresh refused" }
+    }
+    return { why: `renewing it failed: ${e?.said ?? e?.message ?? e}`, kind: "unknown" }
+  }
+}
+
+// gone says whether a sign-in reissued (r) couldn't renew is gone, on
+// WorkBuddy's word: it turned the refresh token away, or refused the access
+// token itself (tokenRefused, invalidToken) with none to renew it with. A
+// desktop sign-in never is: the app's file is read on each request, and
+// signing in to the app again is all it takes.
+const gone = (a, r, tokenRefused) =>
+  a.source !== "desktop" && (r.kind === "refresh refused" || (r.kind === "nothing to renew with" && !!tokenRefused))
+
+// refusedText says WorkBuddy refused a's sign-in, why it wasn't renewed,
+// and what to do.
+function refusedText(site, a, why, note) {
+  return (
+    `${site.name} refused this account's sign-in (401)${why ? "; " + why : ""}. ${note ? note + " " : ""}` +
+    (a.source === "desktop"
+      ? `Sign in to ${site.name} desktop again; magpie reads its sign-in on the next request.`
+      : `Sign in to it again in magpie: Providers → ${site.name} → this account's Sign in again.`)
+  )
+}
+
+// signedOut is the answer to a request WorkBuddy refused this account's
+// sign-in for, renewed or not: a 401 that says so and what to do, which
+// WorkBuddy's own (an HTML page, its {code, msg}) doesn't. expired marks
+// the account in magpie (X-Magpie-Sign-In), out of routing and "sign in
+// again" on its row, till it is signed in again; else it is kept.
+function signedOut(site, a, why, expired, note) {
+  const message = refusedText(site, a, why, note)
   return new Response(JSON.stringify({ error: { message, type: "authentication_error", code: 401 } }), {
     status: 401,
     statusText: "Unauthorized",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", "X-Magpie-Sign-In": expired ? "expired" : "kept" },
   })
 }
 
@@ -1203,9 +1570,12 @@ async function meter(site, a, path, body = {}) {
   } catch {}
   const code = Number.parseInt(env.code, 10) || 0
   if (!res.ok) {
-    if (code) throw new Error(env.msg || `error ${code}`)
-    if (env.msg) throw new Error(env.msg)
-    throw new Error(statusText(res.status))
+    // the status and whether the token itself was refused go with it, for
+    // usage's one renewal on a 401 (reissued)
+    const said = { status: res.status, invalidToken: invalidToken(res) }
+    if (code) throw Object.assign(new Error(env.msg || `error ${code}`), said)
+    if (env.msg) throw Object.assign(new Error(env.msg), said)
+    throw Object.assign(new Error(statusText(res.status)), said)
   }
   if (code) throw new Error(env.msg || `error ${code}`)
   return env.data ?? null
@@ -1228,9 +1598,11 @@ const compact = (n) => (Number.isInteger(n) ? String(n) : n.toFixed(2).replace(/
 // usageOf is the account's credits, from its resource summary: the plan's
 // credits used against what the cycle grants, as magpie's built-in said —
 // the count itself too (amount of limit, in credits), for magpie to say it
-// as used or left beside the share (magpie#659).
+// as used or left beside the share (magpie#659). The free plan is said as a
+// plan: "Free" alone beside the account read as the model being free, and
+// routing as preferring it for that (#337).
 function usageOf(sum, plan) {
-  const out = { plan: plan || (sum?.IsPaidUser ? "Pro" : "Free"), windows: [] }
+  const out = { plan: plan || (sum?.IsPaidUser ? "Pro" : "Free plan"), windows: [] }
   let total = 0, used = 0
   for (const p of sum?.Packages ?? []) {
     total += capacity(p?.CycleTotalCapacity)
@@ -1354,11 +1726,16 @@ function variants(efforts) {
   return Object.fromEntries((efforts ?? []).map((e) => [e, { reasoningEffort: e }]))
 }
 
+// configModels is the site's own list as a provider's models, each on the
+// API it is served on: a Claude model on Messages, the rest on chat.
 function configModels(site) {
   return Object.fromEntries(site.models.map(([id, name, context, efforts]) => [id, {
     name,
     limit: { context, output: 0 },
     tool_call: true,
+    // OpenCode (and magpie's host) read a config model's package and URL
+    // from provider: { npm, api }, not api
+    ...(nativeOf(site, id) ? { provider: { npm: NPM_MESSAGES, api: apiMessages(site) } } : {}),
     ...(efforts ? { reasoning: true, variants: variants(efforts) } : {}),
   }]))
 }
@@ -1368,7 +1745,7 @@ function modelOf(site, provider, m) {
     id: m.id,
     providerID: provider.id,
     name: m.name,
-    api: { id: m.id, url: api(site), npm: NPM },
+    api: { id: m.id, url: nativeOf(site, m.id) ? apiMessages(site) : api(site), npm: nativeOf(site, m.id) ? NPM_MESSAGES : NPM },
     status: "active",
     headers: {},
     options: {},
@@ -1403,7 +1780,7 @@ function modelOf(site, provider, m) {
 // rated. The same rule as magpie's built-in (wbCredits).
 function creditsOf(c) {
   if (c == null || c === "") return undefined
-  const s = String(c).trim().toLowerCase().replace(/^x/, "")
+  const s = String(c).trim().toLowerCase().replace(/\s+credits?$/, "").replace(/^x/, "")
   const n = Number(s)
   return s !== "" && Number.isFinite(n) && n >= 0 ? n : undefined
 }
@@ -1461,6 +1838,32 @@ function priceOf(d, promotions, now = Date.now()) {
   return { free: base === 0, rate: base }
 }
 
+// effortsOf are the levels a config model takes. Most list them in
+// reasoning.supportedEfforts; some (fast-model, deepseek-v4.1-flash, kimi-k3,
+// gemini-3.5-flash … on both sites, plugins#255) say only supportsReasoning
+// and a default reasoning.effort. Those take low, high and max (each
+// reasoned under a real account, on four of them) and their own default.
+const EFFORT_ORDER = ["low", "medium", "high", "xhigh", "max"]
+function effortsOf(d, site, id) {
+  const said = d.reasoning?.supportedEfforts
+  if (Array.isArray(said) && said.length) {
+    // A Claude model on Messages takes max though the config's list stops
+    // at xhigh: measured 2026-10-24, output_config.effort "max" answered
+    // 200 on each Claude model, and on claude-opus-5.5 with more thinking
+    // than xhigh (11248 thinking tokens against 1999, one run each). How
+    // much more a level gives varies by model and run; what matters here
+    // is that a client picking max reaches the server as max, not xhigh.
+    // On chat max means nothing more (see NPM_MESSAGES), so a model there
+    // keeps what the config says.
+    if (nativeOf(site, id) && !said.includes("max")) return [...said, "max"]
+    return said
+  }
+  if (d.supportsReasoning !== true) return []
+  const own = d.reasoning?.effort
+  const set = new Set(["low", "high", "max", ...(typeof own === "string" && EFFORT_ORDER.includes(own) ? [own] : [])])
+  return EFFORT_ORDER.filter((e) => set.has(e))
+}
+
 async function liveModels(site, a) {
   const headers = new Headers()
   sign(site, a, headers)
@@ -1483,7 +1886,7 @@ async function liveModels(site, a) {
         m.output = d.maxOutputTokens
         m.images = d.supportsImages === true && !textOnly(site, id)
         Object.assign(m, priceOf(d, cfg.modelPromotions))
-        const es = d.reasoning?.supportedEfforts ?? []
+        const es = effortsOf(d, site, id)
         if (es.length) {
           const canOff = d.reasoning?.canDisableThinking
           m.efforts = [...(!d.onlyReasoning && (canOff == null || canOff) ? ["none"] : []), ...es]
@@ -1540,6 +1943,9 @@ function makePlugin(site) {
   // the models of this site that refused tool results then the user's
   // message, for this run: their next chats go with replyAfterTools at once
   const endsAfterTools = new Set()
+  // the system prompts this run WorkBuddy refused as an unapproved channel:
+  // their next chats go with systemAsUser at once, not refused first
+  const refusedSystems = new Set()
   return async ({ client }) => ({
     config: async (config) => {
       config.provider ??= {}
@@ -1586,12 +1992,15 @@ function makePlugin(site) {
         const auth = await getAuth()
         if (auth?.type !== "oauth") return {}
         return {
-          baseURL: api(site),
+          // no baseURL: a model's own api.url says where it is served —
+          // <endpoint>/v2 for a chat, <endpoint>/v1 for a Claude model on
+          // Messages. A provider-wide base would put /messages under /v2.
+          baseURL: "",
           apiKey: "",
           async fetch(input, init) {
-            let a = await getAuth()
-            if (a?.type !== "oauth") throw new Error(`${site.name} isn't signed in`)
-            a = await current(site, client, a)
+            const stored = await getAuth()
+            if (stored?.type !== "oauth") throw new Error(`${site.name} isn't signed in`)
+            let a = await current(site, client, stored)
             const req = input instanceof Request ? input : null
             const headers = new Headers(init?.headers ?? req?.headers)
             headers.delete("authorization")
@@ -1601,41 +2010,143 @@ function makePlugin(site) {
             sign(site, a, headers)
             let body = init?.body
             if (body === undefined && req) body = await req.clone().text()
-            body = withSystem(body)
-            const fit = fitted(body)
-            body = normalizeToolChoice(fit.body)
+            // An Anthropic request goes as the agent sent it: WorkBuddy
+            // serves these models on Messages itself, and the rewrites
+            // below (a default system message, the chat endpoint's
+            // max_tokens spelling, tool shapes, the move of a refused
+            // system prompt) exist for the chat endpoint alone. Claude
+            // Code's own system prompt is taken there as it is — measured
+            // 2026-10-24: the billing line, the "official CLI" line,
+            // Codex's and DeepSeek Harness's openings all answer on
+            // /v1/messages, where a chat is refused 11128.
+            const native = isMessages(req ? req.url : String(input), body)
+            let names = {}
+            if (!native) {
+              body = withSystem(body)
+              const fit = fitted(body)
+              body = normalizeToolChoice(fit.body)
+              names = fit.names
+            } else {
+              body = withoutUnsigned(body)
+            }
             attend(headers, body, session)
-            const send = (b) =>
+            const post = (b) =>
               fetch(req ? req.url : input, { ...init, method: init?.method ?? req?.method, headers, body: b }).catch((e) => unanswered(site, a, b, e, init?.signal))
+            // a 401 is answered once, on whichever try meets it: by a
+            // sign-in with another access token (reissued), the request
+            // sent once more with it, never again after that; else, or
+            // when that is refused too, by signedOut. The body is a
+            // string here (or bytes), which goes again as it is; one that
+            // can't be read twice isn't sent again.
+            //
+            // The account is marked (expired) only on WorkBuddy's word
+            // that the sign-in is gone: it turned the refresh token away,
+            // or refused the access token itself (invalidToken) with none
+            // to renew it with, or refused even the token just renewed. A
+            // desktop sign-in is never marked: the app's file is read on
+            // each request, so signing in to the app again is enough.
+            let renewed = false
+            const ours = new WeakSet() // the answers signedOut gave, passed on as they are
+            const out = (why, expired, res) => {
+              const r = signedOut(site, a, why, expired && a.source !== "desktop", edgeNotes.get(res))
+              ours.add(r)
+              return r
+            }
+            const resendable = (b) => b == null || typeof b === "string" || b instanceof ArrayBuffer || ArrayBuffer.isView(b)
+            const send = async (b) => {
+              const res = await post(b)
+              if (res.status !== 401) return res
+              if (renewed) return out("it refused the token renewed for it too", invalidToken(res), res)
+              if (!resendable(b)) return res
+              await res.body?.cancel().catch(() => {})
+              const r = await reissued(site, client, getAuth, a, stored.access)
+              if (!r.a) return out(r.why, gone(a, r, invalidToken(res)), res)
+              renewed = true
+              a = r.a
+              sign(site, a, headers)
+              const again = await post(b)
+              if (again.status !== 401) return again
+              return out("it refused the token renewed for it too", invalidToken(again), again)
+            }
             // a model known to turn tool results then the user's message away
             // gets the empty reply between them up front (see endsAfterTools)
             const model = chatOf(body)?.model
-            const quiet = endsAfterTools.has(model) ? replyAfterTools(body) : null
-            let res = await send(quiet ?? body)
-            if (res.status === 400 && !quiet) {
+            // a system prompt WorkBuddy refused before goes as the user's
+            // words at once (see systemAsUser)
+            const sysKey = native ? "" : systemKey(body)
+            if (sysKey && refusedSystems.has(sysKey)) body = systemAsUser(body) ?? body
+            const shaped = (b) => (!native && endsAfterTools.has(model) ? replyAfterTools(b) ?? b : b)
+            let res = await send(shaped(body))
+            // a signature WorkBuddy's own signing didn't make — a session
+            // moved here from another provider keeps its thinking blocks,
+            // and a truncated or altered one reads the same way — is 11159
+            // too, and none of them can be told apart from a good one
+            // before sending. The request goes once more without them.
+            // Measured 2026-10-24: another vendor's signature answers 11159
+            // on its own, drop_block notwithstanding; without the block the
+            // same history answers 200. Only when the history holds a
+            // signature that isn't this route's own, so a session on this
+            // route never sends twice.
+            if (native && res.status >= 400) {
               const text = await res.text()
-              const again = AFTER_TOOLS_REFUSED.test(text) ? replyAfterTools(body) : null
+              const again = BAD_SIGNATURE.test(text) ? withoutSignedThinking(body) : null
+              if (again) res = await send(again)
+              else res = new Response(text, { status: res.status, statusText: res.statusText, headers: res.headers })
+            }
+            if (res.status === 400 && !native) {              let text = await res.text()
+              const moved = REFUSED.test(text) && sysKey && !refusedSystems.has(sysKey) ? systemAsUser(body) : null
+              if (moved) {
+                refusedSystems.add(sysKey)
+                if (refusedSystems.size > 256) refusedSystems.delete(refusedSystems.values().next().value)
+                body = moved
+                res = await send(shaped(body))
+                if (res.status === 400) text = await res.text()
+              }
+              const again = res.status === 400 && !endsAfterTools.has(model) && AFTER_TOOLS_REFUSED.test(text) ? replyAfterTools(body) : null
               if (again) {
                 endsAfterTools.add(model)
                 res = await send(again)
-              } else {
+              } else if (res.status === 400) {
                 res = new Response(text, { status: res.status, statusText: res.statusText, headers: res.headers })
               }
             }
-            return res.status >= 400 ? explained(res) : kept(await renamed(res, fit.names))
+            if (ours.has(res)) return res
+            // renewed here: a mark the account had comes off
+            return res.status >= 400 ? explained(res) : kept(native ? res : await renamed(res, names), renewed ? "renewed" : "kept")
           },
         }
       },
       // the account's credits, as magpie's built-in showed them; each
       // read keeps the sign-in (signIn), as the built-in's neither marked
-      // an account lapsed nor cleared it
+      // an account lapsed nor cleared it, but for a 401 (gone, below)
       async usage(getAuth) {
         const auth = await getAuth()
         if (auth?.type !== "oauth" || !(auth.access || auth.source)) return { error: "not signed in", signIn: "kept" }
         try {
-          const a = await current(site, client, auth)
+          let a = await current(site, client, auth)
           // the meter has no /v2 prefix, on either site
-          const sum = await meter(site, a, "/billing/meter/get-user-resource-summary")
+          const SUMMARY = "/billing/meter/get-user-resource-summary"
+          // a 401 is answered as a chat's is: once, by a sign-in with
+          // another access token, else the card says WorkBuddy refused
+          // the sign-in and what to do; renewed, a mark comes off
+          let said = "kept"
+          let sum
+          try {
+            sum = await meter(site, a, SUMMARY)
+          } catch (e) {
+            if (e?.status !== 401) throw e
+            const r = await reissued(site, client, getAuth, a, auth.access)
+            if (!r.a) return { error: refusedText(site, a, r.why), signIn: gone(a, r, e.invalidToken) ? "expired" : "kept" }
+            a = r.a
+            try {
+              sum = await meter(site, a, SUMMARY)
+            } catch (e) {
+              if (e?.status !== 401) throw e
+              const why = "it refused the token renewed for it too"
+              return { error: refusedText(site, a, why), signIn: a.source !== "desktop" && e.invalidToken ? "expired" : "kept" }
+            }
+            said = "renewed"
+          }
           const out = usageOf(sum, auth.plan)
           // an enterprise account's summary has no packages: its credits
           // are the enterprise meter's (#1904). A personal account's
@@ -1646,7 +2157,7 @@ function makePlugin(site) {
             try {
               ent = enterpriseUsageOf(await meter(site, a, "/billing/meter/get-enterprise-user-usage"))
             } catch {}
-            if (ent) return { plan: auth.plan || "Enterprise", windows: await spareFree(site, a, [ent]), signIn: "kept" }
+            if (ent) return { plan: auth.plan || "Enterprise", windows: await spareFree(site, a, [ent]), signIn: said }
           }
           // when the credits left run out, for routing to spend them first;
           // a list that can't be read leaves it unknown, the card stands
@@ -1657,7 +2168,7 @@ function makePlugin(site) {
             } catch {}
           }
           await spareFree(site, a, out.windows)
-          return { ...out, signIn: "kept" }
+          return { ...out, signIn: said }
         } catch (e) {
           return { error: e?.message ?? String(e), signIn: "kept" }
         }
@@ -1680,12 +2191,23 @@ function makePlugin(site) {
 
 // REFUSED_HINT is what the user can do about WorkBuddy's "Illegal API
 // invocation from an unapproved channel": both builds answer it to a chat
-// holding words of Codex's or Claude Code's own (magpie #182), whatever the
-// headers. FLAGGED rewrites the ones known; this is for one it doesn't know. It ends the error's message, as magpie's built-in
-// put it (provider.WBRefusedHint), so magpie's routing page says it apart.
+// holding words they turn away, whatever the headers. Codex's and Claude
+// Code's were the first (magpie #182), DeepSeek Harness's and Claude
+// Desktop's came later (#279, #170), and WorkBuddy reads every message, so
+// it names no client. FLAGGED rewrites the words known; this is for ones it
+// doesn't know. It ends the error's message word for word as magpie's
+// Routing page has it (WB_REFUSED in its routing client.js), which says it
+// apart from WorkBuddy's own words.
 const REFUSED_HINT =
-  "WorkBuddy refuses chats from Codex and Claude Code (their system prompt); use it from Hermes, OpenCode or Pi, or add another provider to this group"
+  "WorkBuddy refused words in this client's prompt (most often its system prompt); use it from Hermes, OpenCode or Pi, or add another provider to this group"
 const REFUSED = /unapproved channel|illegal api invocation/i
+
+// BAD_SIGNATURE is WorkBuddy's refusal of a thinking block whose signature it
+// didn't make: internal code 11159, "Invalid `signature` in `thinking` block.
+// The block is bound to a different conversation", else 11133 wrapping
+// "thinking_signature_invalid: replay the original thinking block and
+// signature unchanged".
+const BAD_SIGNATURE = /thinking_signature_invalid|invalid\s+`?signature`?\s+in\s+`?thinking|block is bound to a different conversation|"internal_code"\s*:\s*"?11159/i
 
 // RESTRICTED_HINT is what the user can do about WorkBuddy's 403 code 11140
 // "request illegal", whose displayMsg says "Your account has been restricted
@@ -1708,17 +2230,19 @@ const EXHAUSTED_HINT =
 // another error, and insufficient_quota would rest the account as out of credit.
 const EXHAUSTED_TEXT = /credits exhausted|额度已用尽|["']code["']\s*:\s*["']?14018(?![\d.])/i
 
-// kept is an answer that went through, saying the sign-in is kept: the
-// built-in never cleared a WorkBuddy account's mark, as it never set one.
-function kept(res) {
+// kept is an answer that went through, saying the sign-in is kept (the
+// built-in never cleared a WorkBuddy account's mark, as it never set one),
+// or "renewed" when it went through on a sign-in renewed for a 401, which
+// takes a mark off (see signedOut).
+function kept(res, said = "kept") {
   const headers = new Headers(res.headers)
-  headers.set("X-Magpie-Sign-In", "kept")
+  headers.set("X-Magpie-Sign-In", said)
   return new Response(res.body, { status: res.status, statusText: res.statusText, headers })
 }
 
 // explained is res with REFUSED_HINT, RESTRICTED_HINT or EXHAUSTED_HINT added to that refusal's message.
-// Each refusal says the sign-in is kept: the built-in passed WorkBuddy's
-// 401 on and never marked a WorkBuddy account lapsed.
+// Each refusal says the sign-in is kept: a 401 never comes here, it is
+// signedOut's.
 async function explained(res) {
   const text = await res.text()
   const again = (b) => {
@@ -1733,10 +2257,15 @@ async function explained(res) {
     v = JSON.parse(text)
   } catch {}
   const at = v?.error && typeof v.error === "object" ? v.error : v && typeof v === "object" ? v : null
-  const code = at?.data?.code ?? at?.code ?? v?.code ?? v?.data?.code
+  // the Messages route words its code two more ways (seen 2026-10-24):
+  // {"error": {"code": "400001", "internal_code": "11159", …}}, and
+  // {"code": 11102, "error": "11158:…"}, the code that says what happened
+  // first in a string error, where the outer one only says it failed
+  const inner = at?.internal_code ?? (typeof v?.error === "string" ? v.error.match(/^(\d{5}):/)?.[1] : undefined)
+  const codes = [inner, at?.data?.code, at?.code, v?.code, v?.data?.code].filter((c) => c != null).map(Number)
   const isRefused = REFUSED.test(text)
-  const isRestricted = !isRefused && (Number(code) === RESTRICTED_CODE || RESTRICTED_TEXT.test(text))
-  const isExhausted = !isRestricted && (code === 14018 || Number(code) === 14018 || EXHAUSTED_TEXT.test(text))
+  const isRestricted = !isRefused && (codes.includes(RESTRICTED_CODE) || RESTRICTED_TEXT.test(text))
+  const isExhausted = !isRestricted && (codes.includes(14018) || EXHAUSTED_TEXT.test(text))
   if (!isRefused && !isRestricted && !isExhausted) return again(text)
 
   let msg = text.trim()
@@ -1762,4 +2291,4 @@ export const WorkBuddyAuthPlugin = makePlugin(SITES.workbuddy)
 export const WorkBuddyAIAuthPlugin = makePlugin(SITES["workbuddy-ai"])
 
 // for tests
-export const _internal = { EDGE_READS, fitShape, replyAfterTools, AFTER_TOOLS_REFUSED, enterpriseUsageOf, notDesktop, textOnly, runsOutOf, packagesOf, endOf, enterpriseHeaders, enterpriseOf, liveModels, browserSignIn, withSystem, normalizeToolChoice, fitTools, fitted, renamed, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, RESTRICTED_HINT, EXHAUSTED_HINT, freeCredits, creditsOf, priceOf, fresh, SITES, renewing, renewed, SESSION, attend, turnKey, conversationKey, signatureOf }
+export const _internal = { typeUnions, systemAsUser, systemKey, DEFAULT_SYSTEM, EDGE_READS, fitShape, replyAfterTools, AFTER_TOOLS_REFUSED, enterpriseUsageOf, notDesktop, textOnly, runsOutOf, packagesOf, endOf, enterpriseHeaders, enterpriseOf, liveModels, browserSignIn, withSystem, normalizeToolChoice, fitTools, fitted, renamed, unflagged, usageOf, desktopHeld, explained, REFUSED_HINT, RESTRICTED_HINT, EXHAUSTED_HINT, freeCredits, creditsOf, priceOf, fresh, SITES, renewing, renewed, SESSION, attend, turnKey, conversationKey, signatureOf, isMessages, withoutUnsigned, withoutSignedThinking, answeredBefore, nativeOf, modelOf, configModels, API_MESSAGES: NPM_MESSAGES, API_CHAT: NPM }

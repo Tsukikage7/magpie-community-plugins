@@ -56,10 +56,62 @@ Desktop's sign-in is refreshed only when the app hasn't refreshed it
 itself, and the new token is kept in memory, never written back, as magpie's
 built-in WorkBuddy does.
 
+A chat or usage read WorkBuddy answers 401 (since 0.1.31) is renewed once,
+whatever the token's time, and sent once more. A token another process
+saved since is taken first instead of spending the refresh token again. A
+desktop sign-in is never renewed for it: the app's file is read again, and
+its token is used if the app signed in again. A 401 again, or no new
+token, ends in a 401 that says to sign in again (Providers → WorkBuddy →
+this account's Sign in again in magpie; WorkBuddy desktop for a desktop
+sign-in). The plugin marks the account expired in magpie
+(`X-Magpie-Sign-In: expired`, usage's `signIn`) only on WorkBuddy's word
+that the sign-in is gone: the refresh token refused (401, `invalid_grant`),
+or the access token refused (`WWW-Authenticate: … error="invalid_token"`)
+with no refresh token left to renew it with or just after renewing. A
+failed renewal for another reason, or a bare 401 without `invalid_token`,
+leaves the account as it is; a desktop sign-in is never marked. A 401
+after a renewal takes a mark off (`renewed`).
+
 ## Requests
 
 Chats are chat completions (`@ai-sdk/openai-compatible`) at `<API>/chat/completions`.
 They are streamed only; WorkBuddy refuses a chat that isn't.
+
+**On WorkBuddy (China), the Claude models are served on Anthropic's Messages
+API** instead: `@ai-sdk/anthropic` at `<endpoint>/v1/messages` (streamed only
+as well). `claude-opus-5.5`, `claude-sonnet-5.5`, `claude-opus-5` and
+`claude-opus-4.8-1m` answered there when each model of `/v3/config`'s `cli`
+agent was asked on 2026-10-24; `glm-5.3` and `deepseek-v4.1-flash` answered
+500, `gpt-5.5` and `kimi-k3-1` 400, so every other model stays on chat.
+WorkBuddy AI has no such route (`/v1/messages` is `404 Route Not Found` there
+for every model), so all its models stay on chat, a Claude one too.
+
+A Messages request goes as the agent sent it: no default system message, no
+`max_completion_tokens`/`developer` rewrites, no tool reshaping, and nothing
+moved for a refused system prompt — Claude Code's own prompt is taken as it
+is, billing line and all, where a chat answers 11128 to it. One thing is
+left out: a `thinking` block with no `signature`. A conversation that began
+on chat (or on another provider) carries such blocks, and once a signed one
+from this route sits beside them WorkBuddy refuses the whole request, 11159
+"Invalid `signature` in `thinking` block … bound to a different
+conversation", on every try. Signed blocks go back as they came. It carries
+WorkBuddy's headers as a chat does, the same conversation and turn ids
+included: a tool result in a `user` message of `tool_result` blocks answers
+the step before it, as a `role: "tool"` message does in a chat.
+
+The point of the route is effort. A chat carries `reasoning_effort` alone,
+and WorkBuddy's chat endpoint answers at about the same length whatever it
+says: asked the same question four times each (2026-10-24,
+`claude-opus-5.5`), the median answer was 3884 output tokens at `low`, 5144
+at `max` and 5715 at a value that isn't a level at all. Messages carries
+`output_config.effort`, and `max` is honored there: a median of 30850
+against 5748 at `low`, same model and question, four runs each. A Claude
+model on Messages therefore lists `max` in its levels even where
+`/v3/config` stops at `xhigh`.
+
+`/v1/messages/count_tokens` **is not served** (404). magpie treats a 404 on
+count_tokens as "no counter" (`unsupportedCount`) and answers with its own
+estimate.
 
 Each chat carries WorkBuddy's headers:
 - `Authorization`, `X-User-Id`, `X-Domain`, `X-Product: SaaS`, `X-IDE-Type: WorkBuddy`;
@@ -82,6 +134,24 @@ Each chat carries WorkBuddy's headers:
 
 A chat that doesn't open with a system message is given WorkBuddy's
 default one, as the app does.
+
+WorkBuddy refuses some agents' identity lines as an "unapproved channel"
+(11128), so those lines are reworded before a chat goes out. Since 0.1.27
+(#279) that includes DeepSeek Harness's opening line. A refusal of words
+not reworded yet is sent once more, since 0.1.29, with the system prompt
+moved into the first user message (inside `<instructions>` tags) and
+WorkBuddy's default system prompt in its place: WorkBuddy checks only the
+system and assistant messages, and the line it matched is then in neither.
+A system message later in the chat becomes a user message where it stands.
+The plugin remembers each refused system prompt while it is loaded, so that
+agent's next chats go moved at once. The move can't reach an assistant
+message, so words the model quotes back into one keep that chat refused
+until they are in the list reworded in every message (since 0.1.30, the "Web GUI whose URL the runtime
+context names" line, #291); otherwise only a new chat clears it. A refusal
+that stands after the move ends in a hint that names no one client
+(since 0.1.28): WorkBuddy refused words in this client's prompt; use it from
+Hermes, OpenCode or Pi, or add another provider to the group. Neither
+refusal rests the account.
 
 The loader also translates OpenAI-compatible request spellings WorkBuddy
 doesn't take: `max_completion_tokens` becomes `max_tokens`, `developer`
@@ -205,3 +275,5 @@ magpie's built-in WorkBuddy does more than this package:
 - several accounts under one provider.
 
 OpenCode's plugin API has no place for these.
+
+Credit multipliers accept the international catalog's `x0.34 credits` text as well as `x0.34`. An empty credits value (for example Auto) stays unknown, never free.
