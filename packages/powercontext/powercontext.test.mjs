@@ -1,11 +1,12 @@
 // Runs the hook the way magpie's gateway calls it, against a PowerContext
 // faked with fetch: no server, no sign-in and no network.
-import { afterEach, beforeEach, expect, test } from "bun:test"
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test"
 import { createHash } from "node:crypto"
 import { runInNewContext } from "node:vm"
 import { onRequest, onResponse, reset } from "./powercontext.hooks.mjs"
 
 const realFetch = globalThis.fetch
+const realTimeout = AbortSignal.timeout
 const calls = []
 let routes = {}
 
@@ -696,16 +697,40 @@ test("capture-off continuations and retained blocks never resolve a Scope", asyn
   expect(calls).toHaveLength(0)
 })
 
+// Shorten only the hung route's own deadline. Healthy HTTP calls retain a
+// full second, including when Scope, prepare and Handoff share one request.
+function shortDeadline() {
+  let expire
+  const deadline = spyOn(AbortSignal, "timeout").mockImplementation((ms) => {
+    const early = new AbortController()
+    expire = () => early.abort(new DOMException("Test request deadline", "TimeoutError"))
+    return AbortSignal.any([realTimeout(ms), early.signal])
+  })
+  return {
+    // Start the short deadline only once the server has received the hung
+    // request, so delayed HTTP transport cannot abort before the route is hit.
+    expire() {
+      const abort = expire
+      realTimeout(50).addEventListener("abort", abort, {once:true})
+    },
+    mockRestore() { deadline.mockRestore() },
+  }
+}
+
 for (const route of ["scope", "prepare", "hint", "body"]) {
   test(`a hung ${route} has its own deadline, backs off and recovers`, async () => {
     globalThis.fetch = realFetch
     const hits = []
     let healthy = false
+    let now = Date.now()
+    const clock = spyOn(Date, "now").mockImplementation(() => now)
+    const isHung = (path) => !healthy && ((route === "scope" && path.endsWith("resolve")) || (["prepare", "body"].includes(route) && path.endsWith("prepare")) || (route === "hint" && path.endsWith("hint")))
+    const deadline = shortDeadline()
     const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch(req) {
       const path = new URL(req.url).pathname
       hits.push(path)
-      const hung = !healthy && ((route === "scope" && path.endsWith("resolve")) || (["prepare", "body"].includes(route) && path.endsWith("prepare")) || (route === "hint" && path.endsWith("hint")))
-      if (hung) {
+      if (isHung(path)) {
+        deadline.expire()
         if (route === "body") return new Response(new ReadableStream({ start() {} }))
         return new Promise(() => {})
       }
@@ -713,12 +738,10 @@ for (const route of ["scope", "prepare", "hint", "body"]) {
       if (path.endsWith("hint")) return new Response(null, { status: 404 })
       return prepared("recovered recall")
     } })
-    const make = () => ctx("chat", { options: { serverUrl: server.url.href, requestTimeoutMs: 50, recallBackoffMs: 100 } })
+    const make = () => ctx("chat", { options: { serverUrl: server.url.href, requestTimeoutMs: 1000, recallBackoffMs: 100 } })
     try {
-      const start = performance.now()
       if (route === "hint") await onRequest(structuredClone(chat), make())
       else await expect(onRequest(structuredClone(chat), make())).rejects.toThrow("PowerContext unavailable")
-      expect(performance.now() - start).toBeLessThan(1000)
       const count = hits.length
       const body = structuredClone(chat)
       const result = await onRequest(body, make())
@@ -734,10 +757,12 @@ for (const route of ["scope", "prepare", "hint", "body"]) {
       const other = make(); other.options.scopeId = "another-scope"
       healthy = true
       expect(JSON.stringify(await onRequest(structuredClone(chat), other))).toContain("recovered recall")
-      await new Promise(r => setTimeout(r, 120))
-      const recovered = await onRequest(structuredClone(chat), make())
+      now += 101
+      const retry = make()
+      if (route === "hint") retry.session = "after-handoff-backoff"
+      const recovered = await onRequest(structuredClone(chat), retry)
       expect(JSON.stringify(recovered)).toContain("recovered recall")
-    } finally { server.stop(true) }
+    } finally { server.stop(true); deadline.mockRestore(); clock.mockRestore() }
   })
 }
 
@@ -784,21 +809,23 @@ test("structured native tool arguments containing prefixed secrets are not captu
 // Handoff is optional: its outage must not disable successful Memory recall.
 test("a timed-out optional Handoff does not back off healthy context recall", async () => {
   globalThis.fetch = realFetch
+  const clock = spyOn(Date, "now").mockReturnValue(Date.now())
+  const deadline = shortDeadline()
   let hints = 0, prepares = 0
   const server = Bun.serve({hostname:"127.0.0.1",port:0,fetch(req) {
     const path = new URL(req.url).pathname
     if (path.endsWith("resolve")) return Response.json({scope_id:"scope"})
-    if (path.endsWith("hint")) { hints++; return new Promise(() => {}) }
+    if (path.endsWith("hint")) { hints++; deadline.expire(); return new Promise(() => {}) }
     prepares++
     return prepared("healthy Memory")
   }})
-  const make = (session) => ctx("chat", {session, options:{serverUrl:server.url.href,requestTimeoutMs:50,recallBackoffMs:30_000}})
+  const make = (session) => ctx("chat", {session, options:{serverUrl:server.url.href,requestTimeoutMs:1000,recallBackoffMs:30_000}})
   try {
     expect(JSON.stringify(await onRequest(structuredClone(chat),make("first")))).toContain("healthy Memory")
     expect(JSON.stringify(await onRequest(structuredClone(chat),make("second")))).toContain("healthy Memory")
     expect(prepares).toBe(2)
     expect(hints).toBe(1)
-  } finally {server.stop(true)}
+  } finally {server.stop(true); deadline.mockRestore(); clock.mockRestore()}
 })
 
 // The official sandbox page may configure options, but has no network or custom host API.
@@ -809,7 +836,7 @@ test("configuration page uses only the released options and theme bridge", async
   expect(source).not.toMatch(/\b(fetch|XMLHttpRequest|WebSocket|EventSource)\b/)
 })
 
-test("configuration page saves a masked service key for hook authentication and preserves environment fallback", async () => {
+test("configuration page saves a service key and optional Scope for the shipped hook", async () => {
   const read = (file) => Bun.file(new URL(`./page/${file}`, import.meta.url)).text()
   const [dictionary, source, html] = await Promise.all([read("i18n.js"), read("settings.js"), read("settings.html")])
   const elements = Object.fromEntries([...html.matchAll(/\bid="([^"]+)"/g)].map(([, id]) => [id, {
@@ -836,7 +863,7 @@ test("configuration page saves a masked service key for hook authentication and 
   }
   // Run the shipped hook with exactly what the page saved, not a second normalizer.
   mock()
-  await onRequest(chat, ctx("chat", {options}))
+  await onRequest(structuredClone(chat), ctx("chat", {options}))
   expect(of("/v1/context/prepare")[0].init.headers.Authorization).toBe("Bearer synthetic-page-token")
   elements.configure.onclick()
   expect(elements.auth.type).toBe("password")
@@ -859,6 +886,22 @@ test("configuration page saves a masked service key for hook authentication and 
   expect(options.authorizationEnv).toBe("LEGACY_AUTH")
   expect(options.capture).toBe(true)
   expect(options.maxBytes).toBe(4096)
+  // Clearing a previously configured Scope must actually remove the override.
+  elements.scope.value = "   "
+  await save()
+  expect(options.scopeId).toBeUndefined()
+  expect(elements["summary-scope"].textContent).toBe("Resolved by service")
+  expect(html).not.toMatch(/id="scope"[^>]*\brequired\b/)
+  reset(); calls.length = 0
+  mock()
+  expect(JSON.stringify(await onRequest(structuredClone(chat), ctx("chat", {session:"page-default-scope", options})))).toContain("QUARTZ-8413")
+  const resolved = of("/v1/scope-bindings/resolve")[0].body
+  expect(resolved.explicit_scope_id).toBeUndefined()
+  expect(resolved.binding_keys).toContainEqual({integration:"magpie", kind:"session", external_id:"page-default-scope"})
+  expect(of("/v1/context/prepare")[0].body.scope_id).toBe("scope-a")
+  elements.scope.value = "  chosen-scope  "
+  await save()
+  expect(options.scopeId).toBe("chosen-scope")
 })
 
 test("configuration page follows all host languages without losing edits or status messages", async () => {

@@ -14,10 +14,7 @@ const result = (key, error = false) => message("result", key, error);
 function summary() {
  if (!savedOptions) return;
  $("summary-url").textContent = savedOptions.serverUrl || t("notConfigured");
- $("summary-scope").textContent = savedOptions.scopeId || "—";
- const maxBytes = savedOptions.maxBytes ?? 8000;
- const validBudget = Number.isInteger(maxBytes) && maxBytes >= 512 && maxBytes <= 32768;
- $("budget-limit").textContent = validBudget ? t("budgetLimit", {bytes:maxBytes.toLocaleString(languageTags[language])}) : t("invalidBudget");
+ $("summary-scope").textContent = savedOptions.scopeId || t("automaticScope");
  const capture = $("summary-capture");
  capture.checked = pendingCapture ?? savedOptions.capture === true;
  $("capture-state").textContent = savedOptions.capture === true ? t("on") : t("off");
@@ -83,9 +80,6 @@ const save = async (event) => {
   result("invalidUrl", true); $("url").focus(); return;
  }
  const scopeId = $("scope").value.trim();
- if (!scopeId) {
-  result("invalidScope", true); return;
- }
  const token = $("auth").value.trim().replace(/^Bearer\s+/i, "");
  if (token && /[\s\u0000-\u001f\u007f]/.test(token)) {
   result("invalidKey", true); $("auth").focus(); return;
@@ -94,7 +88,9 @@ const save = async (event) => {
  try {
   const previous = await magpie.options.get();
   // Read again before merging to preserve options not exposed by this form.
-  const next = {...previous, serverUrl:url.href, scopeId};
+  const next = {...previous, serverUrl:url.href};
+  if (scopeId) next.scopeId = scopeId;
+  else delete next.scopeId;
   if (token) next.authorization = `Bearer ${token}`;
   else delete next.authorization;
   await magpie.options.set(next);

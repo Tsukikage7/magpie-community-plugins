@@ -118,24 +118,27 @@ A page package is a folder under `packages/<name>/` with:
 
 ## Gateway hooks
 
-Like middleware, these run on the requests agents send, but in magpie's Bun host rather than on moejs, so one can wait on a service, keep state and import Node's built-ins. They require Magpie 0.1.1273 or newer and declare `magpie.hooks`. The PowerContext package remains pending review for `registry.json`.
+Like middleware, these run on the requests agents send, but in magpie's Bun host rather than on moejs, so one can wait on a service, keep state and import Node's built-ins. They require Magpie 0.1.1273 or newer and declare `magpie.hooks`.
 
 | Package | What it does |
 |---|---|
 | [powercontext](packages/powercontext) | [PowerContext](https://github.com/oceanbase/powercontext) recall and opt-in completed-conversation capture; no client MCP or skill required |
 
-Use the same plugin management commands as middleware. For the unpublished
-PowerContext package, install from a local checkout:
+Use the same plugin management commands as middleware:
 
 ```sh
-magpie plugin add "/absolute/path/to/packages/powercontext"
+magpie plugin add @magpie-community/gateway-powercontext
 ```
 
 Installed plugins use **Plugins › Installed › Options** and the normal on/off
 switch. Deploy PowerContext yourself using its
 [official installation walkthrough](https://powercontext.oceanbase.io/en/docs/get-started/quickstart/),
-then explicitly configure the Server URL, authorization environment variable and
-Scope in plugin options. No Server URL is assumed and capture defaults to off;
+then configure the Server URL and service key in the plugin's connection page
+or Options. The Scope ID is optional: without one, the service resolves the
+session/workspace binding or its default Scope. Use Magpie **0.1.1531 or newer**
+for page saves to reach hooks on the next request; earlier hook-capable versions
+need a Magpie restart after saving page options.
+No Server URL is assumed and capture defaults to off;
 remote/shared-key recall and capture each need a separate opt-in. The package calls an existing
 Server; it does not provision services or manage processes. See the
 [plugin README](packages/powercontext).

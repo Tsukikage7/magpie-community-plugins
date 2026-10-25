@@ -46,15 +46,21 @@ manage their lifecycle. Configure Generation, Embedding and the Memory schedule
 in the Server when automatic extraction and semantic search are needed.
 Gateway clients need no separate PowerContext MCP or skill.
 
-With Magpie 0.1.1273 or newer, install from a local checkout:
+Install with Magpie 0.1.1273 or newer:
 
 ```sh
-magpie plugin add "/absolute/path/to/packages/powercontext"
-magpie plugin options "/absolute/path/to/packages/powercontext" '{"serverUrl":"http://127.0.0.1:8000","scopeId":"YOUR_SCOPE"}'
+magpie plugin add @magpie-community/gateway-powercontext
+magpie plugin options @magpie-community/gateway-powercontext '{"serverUrl":"http://127.0.0.1:8000"}'
 ```
 
+Alternatively, find **PowerContext** in Magpie's Plugins discovery tab.
+Use **Magpie 0.1.1531 or newer** for configuration saved from the plugin page
+to take effect on the next request. Earlier hook-capable versions require
+restarting Magpie after saving page options.
+
 In the plugin page's Connection settings, enter the existing Server address,
-Scope ID and service key. Enter the token directly; the form adds `Bearer`
+optional Scope ID and service key. Leave Scope ID empty to use the session/workspace
+binding or the Server's default Scope. Enter the token directly; the form adds `Bearer`
 automatically and also accepts an existing `Bearer <token>` value. Leave it empty
 when the Server does not require authentication. The key is stored in Magpie's
 local plugin configuration, not the system keychain. Do not put credentials in
@@ -66,8 +72,7 @@ Existing `authorizationEnv` configurations remain supported: when no direct
 the named variable in Magpie's startup environment. Clearing the form's key
 removes the direct value and restores this fallback.
 
-The package is not published yet. After publication, use the community plugin
-installation flow. Installing the plugin does not deploy its external service.
+Installing the plugin does not deploy its external service.
 
 ## Behavior and options
 
@@ -209,15 +214,12 @@ also update dialogs, validation and status messages without discarding unsaved
 form edits. Unsupported languages fall back to English. Brand names, identifiers
 and the official documentation URL stay unchanged.
 
-Magpie's sandbox disallows network access and provides no custom hook-read API.
-The page retains the request topology, recall-budget grid, request-record area
-and a separate Source-to-Memory extraction diagram. These are explicitly labeled
-as structural or unavailable, with no simulated request animations or counters.
-The budget limit reflects saved maxBytes (8000 by default); usage and grid cells
-remain unmeasured, not zero or free space. It does not display live Sources,
-Memory or extraction progress. Use the independently deployed PowerContext dashboard
-for service records and Memory provenance. Magpie's native plugin diagnostics
-report hook outcomes. Saving options does not probe the Server or write Memory.
+The page contains the connection summary and form, the capture switch, an
+explanation of what recall and capture send to the configured service, and the
+official deployment guide. Scope ID is optional, matching the hook's service-side
+binding/default resolution. Use the independently deployed PowerContext dashboard
+for service records and Memory provenance, and Magpie's native plugin diagnostics
+for hook outcomes. Saving options does not probe the Server or write Memory.
 
 The package has no installer, CLI executable, background supervisor or standalone
 management server. Tests in this repository cover the hook contract; external
