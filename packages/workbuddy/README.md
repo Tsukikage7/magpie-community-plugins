@@ -26,6 +26,15 @@ The package exports `WorkBuddyAuthPlugin` (`workbuddy`) and
 
   WorkBuddy 5.6 and later keep the sign-in encrypted, which only the app
   opens, so this way fails there and says so: use the browser sign-in.
+- **API key** (since 0.1.37). A key made on the build's own keys page
+  (`https://www.workbuddy.cn/profile/keys` for `workbuddy`,
+  `https://www.workbuddy.ai/profile/keys` for `workbuddy-ai`), sent as
+  WorkBuddy's own CLI sends one: `X-API-Key` and `Authorization: Bearer`,
+  both the key, and `X-User-Id: anonymous_<the key's last 8 characters>`,
+  to the same API as the other sign-ins. A key isn't renewed; a refused one
+  says to check it. A key's credits are unknown (WorkBuddy's own client reads
+  none with a key), and its models are `/v3/config`'s only for `ck_`/`pt_`
+  keys, as the CLI asks; any other key keeps the list below.
 
 A browser sign-in is kept as an OpenCode `oauth` auth: the access and
 refresh tokens, their expiry, the user id and the domain; desktop's as a
@@ -56,14 +65,70 @@ Desktop's sign-in is refreshed only when the app hasn't refreshed it
 itself, and the new token is kept in memory, never written back, as magpie's
 built-in WorkBuddy does.
 
+A chat or usage read WorkBuddy answers 401 (since 0.1.31) is renewed once,
+whatever the token's time, and sent once more. A token another process
+saved since is taken first instead of spending the refresh token again. A
+desktop sign-in is never renewed for it: the app's file is read again, and
+its token is used if the app signed in again. A 401 again, or no new
+token, ends in a 401 that says to sign in again (Providers → WorkBuddy →
+this account's Sign in again in magpie; WorkBuddy desktop for a desktop
+sign-in). The plugin marks the account expired in magpie
+(`X-Magpie-Sign-In: expired`, usage's `signIn`) only on WorkBuddy's word
+that the sign-in is gone: the refresh token refused (401, `invalid_grant`),
+or the access token refused (`WWW-Authenticate: … error="invalid_token"`)
+with no refresh token left to renew it with or just after renewing. A
+failed renewal for another reason, or a bare 401 without `invalid_token`,
+leaves the account as it is; a desktop sign-in is never marked. A 401
+after a renewal takes a mark off (`renewed`).
+
 ## Requests
 
 Chats are chat completions (`@ai-sdk/openai-compatible`) at `<API>/chat/completions`.
 They are streamed only; WorkBuddy refuses a chat that isn't.
 
+**On WorkBuddy (China), the Claude models are served on Anthropic's Messages
+API** instead: `@ai-sdk/anthropic` at `<endpoint>/v1/messages` (streamed only
+as well). `claude-opus-5.5`, `claude-sonnet-5.5`, `claude-opus-5` and
+`claude-opus-4.8-1m` answered there when each model of `/v3/config`'s `cli`
+agent was asked on 2026-10-24; `glm-5.3` and `deepseek-v4.1-flash` answered
+500, `gpt-5.5` and `kimi-k3-1` 400, so every other model stays on chat.
+WorkBuddy AI has no such route (`/v1/messages` is `404 Route Not Found` there
+for every model), so all its models stay on chat, a Claude one too.
+
+A Messages request goes as the agent sent it: no default system message, no
+`max_completion_tokens`/`developer` rewrites, no tool reshaping, and nothing
+moved for a refused system prompt — Claude Code's own prompt is taken as it
+is, billing line and all, where a chat answers 11128 to it. One thing is
+left out: a `thinking` block with no `signature`. A conversation that began
+on chat (or on another provider) carries such blocks, and once a signed one
+from this route sits beside them WorkBuddy refuses the whole request, 11159
+"Invalid `signature` in `thinking` block … bound to a different
+conversation", on every try. Signed blocks go back as they came. It carries
+WorkBuddy's headers as a chat does, the same conversation and turn ids
+included: a tool result in a `user` message of `tool_result` blocks answers
+the step before it, as a `role: "tool"` message does in a chat.
+
+The point of the route is effort. A chat carries `reasoning_effort` alone,
+and WorkBuddy's chat endpoint answers at about the same length whatever it
+says: asked the same question four times each (2026-10-24,
+`claude-opus-5.5`), the median answer was 3884 output tokens at `low`, 5144
+at `max` and 5715 at a value that isn't a level at all. Messages carries
+`output_config.effort`, and `max` is honored there: a median of 30850
+against 5748 at `low`, same model and question, four runs each. A Claude
+model on Messages therefore lists `max` in its levels even where
+`/v3/config` stops at `xhigh`.
+
+`/v1/messages/count_tokens` **is not served** (404). magpie treats a 404 on
+count_tokens as "no counter" (`unsupportedCount`) and answers with its own
+estimate.
+
 Each chat carries WorkBuddy's headers:
 - `Authorization`, `X-User-Id`, `X-Domain`, `X-Product: SaaS`, `X-IDE-Type: WorkBuddy`;
-- `User-Agent: WorkBuddy/5.5.6`. Without it, WorkBuddy answers error 10085;
+- the desktop CLI's `User-Agent`, `WorkBuddy/<app> <appName>/<app> CLI/<cli>`:
+  `WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0` on the China build and
+  `WorkBuddy/5.9.3 workbuddy-ai/5.9.3 CLI/2.165.0` on WorkBuddy AI, each
+  build's current app on 2026-10-29; `X-IDE-Version` is the app's version.
+  A User-Agent not starting `WorkBuddy/<version>` is answered error 10085;
 - the client's, which WorkBuddy's usage list shows as the client that asked
   (使用端): `X-Agent-Purpose: conversation`, `X-IDE-Name: WorkBuddy`,
   `X-IDE-Version`, `X-Agent-Intent: craft`, `X-Requested-With`. Both builds
@@ -72,21 +137,54 @@ Each chat carries WorkBuddy's headers:
 - the conversation's ids: `X-Conversation-ID`, `X-Conversation-Request-ID`,
   `X-Conversation-Message-ID`, `X-Request-ID`. WorkBuddy's backend counts a
   user send as one request by `X-Conversation-Request-ID`, so every step of
-  one send — a tool result sent back, a retry, another account answering —
-  carries the same one, and the user's next message carries another. The
+  one send — a tool result sent back, a retry — carries the same one, and
+  the user's next message carries another. Both ids are one account's own,
+  as WorkBuddy's client is signed in as one: a conversation sent as another
+  account (another of a group, or a sign-in saved since) carries that
+  account's ids, never the same ones under two `X-User-Id`s. The
   conversation's is the session magpie (or OpenCode) names the request by,
   else the chat's first user message; nothing is made up when neither names
   one, a made-up conversation of the request's own being what splits one
   conversation into many in the usage detail;
-- WorkBuddy AI also takes `X-Agent-Type: main`.
+- what the CLI adds to a model request alone: `X-Agent-Type: main` on both
+  builds, `X-Agent-Runtime: local-agent` (new in 5.9),
+  `Accept: application/json`, and the `X-Stainless-*` headers of the OpenAI
+  SDK it sends through (openai 6.25.0 on Electron 37's Node v22.21.1, a
+  1200s timeout, no retries).
+
+Not sent: `X-Device-Token`, which the desktop app gets from Tencent's
+native device SDK before each prompt, and a `traceparent`, which the CLI
+adds only while its server-side tracing is on.
 
 A chat that doesn't open with a system message is given WorkBuddy's
 default one, as the app does.
 
+WorkBuddy refuses some agents' identity lines as an "unapproved channel"
+(11128), so those lines are reworded before a chat goes out. Since 0.1.27
+(#279) that includes DeepSeek Harness's opening line. A refusal of words
+not reworded yet is sent once more, since 0.1.29, with the system prompt
+moved into the first user message (inside `<instructions>` tags) and
+WorkBuddy's default system prompt in its place: WorkBuddy checks only the
+system and assistant messages, and the line it matched is then in neither.
+A system message later in the chat becomes a user message where it stands.
+The plugin remembers each refused system prompt while it is loaded, so that
+agent's next chats go moved at once. The move can't reach an assistant
+message, so words the model quotes back into one keep that chat refused
+until they are in the list reworded in every message (since 0.1.30, the "Web GUI whose URL the runtime
+context names" line, #291); otherwise only a new chat clears it. A refusal
+that stands after the move ends in a hint that names no one client
+(since 0.1.28): WorkBuddy refused words in this client's prompt; use it from
+Hermes, OpenCode or Pi, or add another provider to the group. Neither
+refusal rests the account.
+
 The loader also translates OpenAI-compatible request spellings WorkBuddy
 doesn't take: `max_completion_tokens` becomes `max_tokens`, `developer`
-messages become `system`, and an object `tool_choice` becomes WorkBuddy's
-string form.
+messages become `system`, an object `tool_choice` becomes WorkBuddy's
+string form, and an earlier assistant turn's `reasoning_content` (or
+`reasoning_details` text) goes as `reasoning`, the field WorkBuddy's own
+client sends. WorkBuddy drops `reasoning_content`, so a client such as Grok
+Build that sends it lost its earlier thinking; nothing is folded into the
+message's content.
 
 A chat's tools are given shapes WorkBuddy's models take. Without them
 WorkBuddy AI answers 400 "Invalid request parameters" (11133), DeepSeek's
@@ -140,7 +238,18 @@ is used.
 - Kimi-K3, Kimi-K2.6
 - MiniMax-M3
 
-A model's reasoning levels are its variants (`reasoningEffort`).
+A model's reasoning levels are its variants (`reasoningEffort`). A chat
+that names no level goes at the model's own default from the config
+(`reasoning.defaultEffort`, "high" for DeepSeek-V4.1-Flash), as WorkBuddy's
+client sends it: WorkBuddy doesn't think when a chat names none, so
+OpenCode's default variant got answers without thinking. An effort the
+client names, `none` too, goes as it came.
+
+A chat goes gzipped (`Content-Encoding: gzip`), as WorkBuddy's own client
+sends its model requests (`RequestBodyGzip` in both builds' product.json).
+Claude's Messages route goes as it came, and so does anything that isn't a
+chat completion: magpie's drawings (`/v2/images/generations`,
+`/v2/images/edits`) go as plain JSON, which is all the images API reads.
 
 A model's price is its `credits` ("x0.29") and the config's
 `modelPromotions`. A discount for whole days (Step-5-Preview's 独家限免) is
@@ -148,6 +257,22 @@ the price now, with the price before it (`rateWas`). A price that holds only
 some hours of the day (Hy4 preview, free 23:00–8:00) is given as its full
 price, never as free: magpie keeps the list until it asks again, so a list
 asked for at night would say "free" all day (#121).
+
+### Free models only
+
+Each site (WorkBuddy, WorkBuddy AI) has a "Free models only" switch in its
+provider settings in magpie, off by default (#430). When it is on:
+
+- the list holds only the models the site serves at no cost now. A model free
+  only at night, or one with no price, counts as paid;
+- a request for any other model is answered by the plugin with a 404
+  `model_not_found` and never sent, so no credits are spent. magpie rests
+  only that model and tries the next provider;
+- if the price list can't be read, nothing is sent (503), since whether the
+  model is free is unknown. An API key WorkBuddy lists no prices for lists
+  no models.
+
+The price list is read again at most once a minute for requests.
 
 ## Credits in magpie
 
@@ -205,3 +330,5 @@ magpie's built-in WorkBuddy does more than this package:
 - several accounts under one provider.
 
 OpenCode's plugin API has no place for these.
+
+Credit multipliers accept the international catalog's `x0.34 credits` text as well as `x0.34`. An empty credits value (for example Auto) stays unknown, never free.
