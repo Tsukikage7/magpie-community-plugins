@@ -6,7 +6,7 @@
 
 A magpie provider plugin that connects [Capy](https://capy.ai) to [magpie](https://usemagpie.ai). Forked from [baijiu666/magpie-Capy](https://github.com/baijiu666/magpie-Capy), with Cookie login added for headless Linux servers: no desktop app, no graphical browser — paste two pieces of Cookie and sign in. 3 free models, native SSE streaming / non-streaming chat, image / PDF attachments.
 
-当前版本：**v0.2.2**（`package.json` 版本 `0.2.2`，对应 git tag `v0.2.2`；未发布 GitHub Release，未发布到 npm）。
+当前版本：**v0.2.3**（`package.json` 版本 `0.2.3`，对应 git tag `v0.2.3`；未发布 GitHub Release，未发布到 npm）。
 
 - **纯无头**：自动注册设备，走 Capy device tunnel；运行时不需要 Capy 桌面端。
 - **登录**：本机 Capy 客户端导入 / 浏览器登录 / 粘贴 Cookie 登录（无头服务器适用；两框分别粘贴，获取方法见下方登录说明）。
