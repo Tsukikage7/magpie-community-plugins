@@ -176,6 +176,7 @@ expected string, received undefined`，这时代码根本没执行到插件里�
 | **管理页 `/admin` 账号池显示 0，但 `/admin/accounts` 明明有账号** | 页面顶部没填 API Key：页面只在填了 key 后才带 `Authorization` 调 `/admin/accounts`，否则一律 401、所有数字显示 0（不是后端问题）。点右上「保存」存 key 即可；也可以直接打开 `http://127.0.0.1:18610/?key=<m2a_…>` 免填 |
 | 图片 / 视频链接打不开 | muse2api 的 `PUBLIC_BASE` 不是外部可达地址；图片本身生成成功时任务里也有 `bytes` / `size` 可核对 |
 | 视频生成成功但报 `muse2api: {"detail":"Not Found"}` | 网关缺 OpenAI 视频下载端点 `GET /v1/videos/{task_id}/content`（Magpie core 不读 `result.url`，直接拉该路由）；换用含 commit `c7054b18` 的 muse2api。注意 `{"detail":"Not Found"}` 是 FastAPI 未匹配路由的默认体，业务 404 会带 `{"error":{"message":…}}` |
+| 对话里选 Muse Image 报 `413 preflight_compress_failed` | DSH 在 preflight 阶段把会话工具目录（`tools[]`）发给了 32k 窗口的图像模型：报错 meter 里 `tools[] ~70,903` > 窗口 `32,000`，请求根本没转发。图像模型不需要工具，给 `muse2api/muse-image` 关闭工具挂载（或只留 0-1 个最小工具）即可 |
 
 ## 更新
 

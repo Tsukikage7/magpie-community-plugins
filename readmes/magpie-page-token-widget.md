@@ -1,6 +1,6 @@
 # magpie-page-token-widget
 
-> [English](README.en.md) · 中文 · 当前版本 0.4.16（变更见 [CHANGELOG.md](CHANGELOG.md)）
+> [English](README.en.md) · 中文 · 当前版本 0.4.17（变更见 [CHANGELOG.md](CHANGELOG.md)）
 
 把 iPhone 桌面的额度组件接进 Magpie：装上这个插件，扫一次码，手机上就能显示 Codex、MiniMax、GLM 各家套餐的剩余额度与真实 Token 用量。
 
@@ -296,16 +296,36 @@ npm test
 
 ### 发一版
 
-发到 npm 用的是 GitHub Actions 自己的身份（npm 叫它 trusted publisher），**不需要任何令牌**。
+发到 npm 用的是 GitHub Actions 自己的身份（npm 叫它 trusted publisher），**不需要保存任何长期令牌**。
 
 1. 改 `package.json` 里的版本号，写 `CHANGELOG.md`。
 2. `npm test` 过了以后提交、推到 `main`。
-3. 打标签推上去：`git tag -a v0.4.16 -m "v0.4.16"`，再 `git push origin v0.4.16`。
-4. 发一个 Release（`gh release create v0.4.16`）。`.github/workflows/publish.yml` 看见 Release 就自己把包发到 npm。
+3. 打标签推上去：`git tag -a v0.4.18 -m "v0.4.18"`，再 `git push origin v0.4.18`。
+4. 发一个 Release（`gh release create v0.4.18`）。`.github/workflows/publish.yml` 看见 Release 就自己把包发到 npm。
 
-工作流发之前先问两件事：这次发布在不在 `main` 上，标签和 `package.json` 里的版本号是不是同一个。有一处不对，它就不发。
+工作流分成两个活。第一个活读代码、问问题、打包；第二个活只拿到打包好的那个包发到 npm，**仓库里的代码一行都不在第二个活里跑**。只有第二个活手里有那个一次性的 OIDC 令牌，所以待发布的代码碰不到它。
+
+第一个活在发之前问五件事，规则都写在 `scripts/verify-release.mjs` 里：
+
+1. 标签是版本号的名字（预发布不算：`0.4.17-rc.1` 这种不发）；
+2. 标签真的是这个仓库里的标签（不是碰巧同名的分支），并且它说的是哪个提交；
+3. 那个提交在 `main` 上；
+4. 那个提交的 `package.json` 里的版本号就是标签里的版本号；
+5. 那个提交没有改掉规则本身——`publish.yml` 和 `scripts/verify-release.mjs` 跟 `main` 上的一字不差。
+
+有一处不对，它就不发。这些规则是拿真的小仓库跑出来的（`test/release-guard.test.mjs`），所以规则一改，测试就红。预发布的 Release 也不发到 npm——npm 会把它变成所有人默认拿到的那个版本。
+
+预发布有两种，走的是两条路：**标签名带 `-rc.1` 的**（`v0.4.19-rc.1`）由守卫当场拒掉，这一次运行是**红的**（检查没过），什么也没发出去；**标签是干净的版本号、但 Release 上勾了「预发布」的**由守卫放行，发包那个活被**跳过**，运行是**绿的**，同样什么也没发出去。两种都不发，区别只在这条流水线看起来是红是绿。
+
+第 5 条比的是 `main` **此刻**的那一份：标签打完之后 `main` 又动了、而动的那次改了规则，那么这个标签再发一次会被拒（发一次是对的：标签里的规则和当时的 `main` 一字不差）。这是有意的——它挡的是「拿一个旧标签补发一个后来改了规则的版本」。
 
 npm 那边只写一次：包的设置（https://www.npmjs.com/settings）→ **Trusted Publisher** → GitHub Actions，
 **Organization or user** 填 `liuzq1103`，**Repository** 填 `magpie-page-token-widget`，**Workflow filename** 填
 `publish.yml`，**Environment name** 留空，并且允许 `npm publish`。这几项和这里要一字不差，对不上 npm 会
 拒绝，而它只在日志里说一句。
+
+守卫挡的是**手滑**，不是**有心的人**。它保证的是：发出去的那个提交在 `main` 上；规则没被这个提交改过；
+发出去的包是守卫验过的那一份。但 Release 事件触发的工作流是从**标签**上跑的（npm 的 provenance 里写着
+`workflow.ref = refs/tags/…`），所以一个自带规则标签的发布仍然绕得过自己——跑起来的就是那份被改过的规则。
+反过来说，能推标签的人本来就有仓库的写权限，本来就能改 `main` 上的工作流。所以这套守卫的真正保障是
+**防误操作、防离 `main` 的发布**，不是防有写权限的恶意维护者。
