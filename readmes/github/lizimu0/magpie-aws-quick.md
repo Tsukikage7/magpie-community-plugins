@@ -50,10 +50,12 @@ What the plugin does:
    body likewise base64-wrapped inner JSON). An application-level `ping` goes
    out every 45s, matching the desktop client.
 4. **Protocol translation**: OpenAI `messages` are rendered into Quick's
-   `text` (below) — caller system instructions ride both `system_prompt` (which
-   the server applies per turn) and the desktop composer's `custom_prompt` when
-   the frame budget allows; downlink
-   `text_delta`/`thinking_delta`/`turn_usage`/`message_complete` become
+   `text` (below) — caller system instructions ride the desktop composer's
+   `custom_prompt` field (verified live: `custom_prompt` is the field the server
+   applies and persists on the thread; reused turns keep `custom_prompt`
+   whenever it fits alongside the delta to preserve rule salience and prompt
+   cache hits, and omit it only when a large delta needs the full 64 KB frame);
+   downlink `text_delta`/`thinking_delta`/`turn_usage`/`message_complete` become
    OpenAI `content`/`reasoning_content`/`usage`. A user turn ends at
    `message_complete` with `continuation_expected !== true` — the same
    rule the desktop renderer uses.
@@ -170,9 +172,10 @@ magpie login aws-quick        # pick a sign-in method when prompted
   browser OAuth has no local outpost, the plugin persists a stable generated
   `outpost_id` UUID per account.
 - **Message size**: the whole `user_message` frame is hard-capped at 64 KB
-  server-side (`text` + `system_prompt` share it). Oversized system prompts /
+  server-side (`text` + `custom_prompt` share it). Oversized system prompts /
   tool schemas / history are compacted automatically (schema de-annotation,
-  tool-spec lite fallback, oldest-first history trimming, capped tool
+  compact typed signatures / lite / names-only fallback, oldest-first history
+  trimming, water-filling per-block budgets across single or parallel tool
   results); truncation is surfaced as a `> [quick] …truncated` note.
 
 ## Security & credentials
