@@ -1,8 +1,8 @@
-# GemPT v0.6.0
+# GemPT v0.7.1
 
 [English Quick Start & Docs](./README.en.md) · [Antigravity Plugin README](./plugin/README.md) · [Third-Party Licenses](./THIRD_PARTY_LICENSES.txt)
 
-GemPT 让 Gemini 通过本机 [Magpie](https://github.com/yetone/magpie) 咨询 GPT、委派 Codex 仓库任务，并在 **GemPT** 侧栏实时查看和介入运行。Magpie 插件、Antigravity stdio MCP、hooks、安装器和 CLI 共用一套 Node.js ESM 核心；运行时零第三方依赖（仅用 Node.js 内置模块），GemPT 随包提供预构建资源与完整第三方开源许可（[THIRD_PARTY_LICENSES.txt](./THIRD_PARTY_LICENSES.txt)）。
+GemPT 让 Gemini 通过你的 [Magpie](https://github.com/yetone/magpie) 咨询所选下属模型、委派仓库任务，并在 **GemPT** 侧栏实时查看和介入运行。Magpie 插件、Antigravity stdio MCP、hooks、安装器和 CLI 共用一套 Node.js ESM 核心；运行时零第三方依赖（仅用 Node.js 内置模块），GemPT 随包提供预构建资源与完整第三方开源许可（[THIRD_PARTY_LICENSES.txt](./THIRD_PARTY_LICENSES.txt)）。
 
 ## 前置依赖与版本要求
 
@@ -10,7 +10,7 @@ GemPT 让 Gemini 通过本机 [Magpie](https://github.com/yetone/magpie) 咨询 
 | --- | --- | --- |
 | **Node.js** | `>= 20.11.0` | 运行 MCP server、hooks、CLI 与安装器 |
 | **Magpie** | `>= 0.1.1340` | 本地网关（默认 `http://127.0.0.1:3425`），从 [yetone/magpie](https://github.com/yetone/magpie) / [usemagpie.ai](https://usemagpie.ai) 安装并登录 ChatGPT/Codex 订阅 |
-| **Magpie 侧 GemPT 插件** | `0.6.0` | 提供 `Plugins → GemPT` 面板，并托管共享 Codex `app-server`（Windows 跨 Magpie 热重载独立存活，支持面板一键重启）；**仅单独安装 Codex CLI 无法替代** |
+| **Magpie 侧 GemPT 插件** | `0.7.1` | 提供 `Plugins → GemPT` 面板，并托管共享 Codex `app-server`（Windows 跨 Magpie 热重载独立存活，支持面板一键重启）；**仅单独安装 Codex CLI 无法替代** |
 | **Codex CLI** | `@openai/codex`（已实测 `0.164.0`） | 仅 `gpt_run` 仓库执行需要；通过 `npm install -g @openai/codex` 安装（纯 `gpt_ask` 咨询可不装） |
 | **Git** | 任意现代版本 | 仅并发隔离 `workspace="share"` 需要 |
 
@@ -18,7 +18,7 @@ GemPT 让 Gemini 通过本机 [Magpie](https://github.com/yetone/magpie) 咨询 
 
 ### 1. 安装并登录 Magpie
 
-安装 [Magpie](https://usemagpie.ai)（`>= 0.1.1340`），启动本地网关并在 Magpie 中登录你的 ChatGPT/Codex 订阅（如需 API 兜底，也可配置 `openai/*` 提供商）。
+安装 [Magpie](https://usemagpie.ai)（`>= 0.1.1340`），启动网关并在 Magpie 中接入至少一个对话模型。推荐 GPT，也可以选择其他提供商的模型。
 
 ### 2. 安装 Magpie 侧插件
 
@@ -26,23 +26,27 @@ GemPT 让 Gemini 通过本机 [Magpie](https://github.com/yetone/magpie) 咨询 
 
 ```bash
 # 推荐：从 GitHub tag 安装
-magpie plugin add github:yizhang-dream/gempt#v0.6.0
+magpie plugin add github:yizhang-dream/gempt#v0.7.1
 ```
 
 > 注：`gempt` 尚未发布到 npm registry，请勿直接运行裸包名命令 `magpie plugin add gempt`（当前会返回 404）。
 
-在 Magpie 左侧栏打开 **Plugins → GemPT**，确认网关连通、订阅模型就绪以及共享 Codex `app-server` 状态正常，点击 **“一键启用订阅配置”**（或运行 `gempt init`）。
+在 Magpie 左侧栏打开 **Plugins → GemPT**，确认网关连通后，点击 **启用模型配对**（或运行 `gempt init`）。
 
 > Magpie 默认向其他接入客户端暴露 HTTP MCP（`http://127.0.0.1:3425/mcp/magpie/tools/gempt`），且默认 `exec: false`（仅允许 `gempt_ask`、只读 `gempt_run(access="inspect")` 与 `gempt_ctl`）。如需允许 HTTP 客户端执行写入，在 Magpie GemPT 插件选项中显式开启 `exec: true`。
 
 ### 3. 安装 Antigravity 侧插件
 
+在 Magpie 的 **Plugins → GemPT → 概览 → 客户端接入** 展开 **启用 Antigravity 集成**。核对插件和命令目录后确认安装；受限内嵌页面会提供独立控制台链接和复制地址按钮。安装使用 Magpie 随包的版本，完成后在 Antigravity 打开新会话。只用 Magpie 的用户可跳过此步。
+
+安装位置按运行 Magpie 的系统账户解析。若使用非标准目录，在 Magpie 的进程环境中设置 `GEMPT_AGY_PLUGIN_DIR`（GemPT 插件的完整目标目录）和可选的 `GEMPT_BIN_DIR`（命令目录），然后重启 Magpie。远程网关地址是单独的设置；如果 Antigravity 和 Magpie 不在同一机器，请在 Antigravity 所在机器执行下面的命令，并配置可访问的网关。
+
 ```bash
 # 推荐：通过 GitHub tag 一键安装
-npx --yes github:yizhang-dream/gempt#v0.6.0 install-agy
+npx --yes github:yizhang-dream/gempt#v0.7.1 install-agy
 ```
 
-> 注：`gempt` 尚未发布到 npm registry，请使用上述 GitHub tag 渠道或从本地源码安装（裸 npm 命令 `npx --yes gempt@0.6.0 install-agy` 尚未生效）。
+> 注：`gempt` 尚未发布到 npm registry，请使用上述 GitHub tag 渠道或从本地源码安装（裸 npm 命令 `npx --yes gempt@0.7.1 install-agy` 尚未生效）。
 
 从本地源码安装时：
 - **Linux / macOS**：`bash install.sh`（支持 `--target <目录>`）
@@ -86,7 +90,7 @@ gempt init --non-interactive
 
 ## 控制面板的两种用法
 
-- **MCP 编排供 Antigravity 使用。** 在 `Plugins → GemPT` 为 Hydrogen、Neon、Carbon 选择 GPT/Codex 模型，或选择「默认模型」以使用 Magpie 探测到的默认 Codex 订阅模型。面板同时提供思考强度、Swarm、执行权限、容灾和实际 Token 占比。工作分工有 `0%` 关闭、`15%` 重活提示、`35%` 源码写转 GPT、`60%` 加每回合 5 步核实止损，以及 `80%` 入口直派加 2 步核实。用 `/gempt` 编排任务，用 `/gempt-chore` 做摘要、压缩和分类。
+- **MCP 编排供 Antigravity 使用。** 在 `Plugins → GemPT` 为 Hydrogen、Neon、Carbon 选择当前 Magpie 网关列出的任意模型或路由组（仓库任务要求该路由支持 Responses 和工具调用），或选择「默认模型」以使用 Magpie 探测到的默认 Codex 订阅模型。面板同时提供思考强度、Swarm、执行权限和实际 Token 占比。工作分工有 `0%` 关闭、`15%` 重活提示、`35%` 源码写转 GPT、`60%` 加每回合 5 步核实止损，以及 `80%` 入口直派加 2 步核实。用 `/gempt` 编排任务，用 `/gempt-chore` 做摘要、压缩和分类。
 - **路由组直连供其他 Agent 和客户端使用。** 在面板预览、创建、复制 `group/gempt-sonnet`、`group/gempt-opus`、`group/gempt-fable`，然后在客户端模型栏选用。终端可用 `gempt presets --preview` 预览、`gempt presets --apply` 创建。
 
 ## 命令行
