@@ -1,8 +1,8 @@
-# GemPT v0.4.1
+# GemPT v0.6.0
 
 [English Quick Start & Docs](./README.en.md) · [Antigravity Plugin README](./plugin/README.md) · [Third-Party Licenses](./THIRD_PARTY_LICENSES.txt)
 
-GemPT 让 Gemini 通过本机 [Magpie](https://github.com/yetone/magpie) 咨询 GPT、委派 Codex 仓库任务，并在 **GemPT Live** 侧栏实时查看和介入运行。Magpie 插件、Antigravity stdio MCP、hooks、安装器和 CLI 共用一套 Node.js ESM 核心；运行时零第三方依赖（仅用 Node.js 内置模块），GemPT Live 随包提供预构建资源与完整第三方开源许可（[THIRD_PARTY_LICENSES.txt](./THIRD_PARTY_LICENSES.txt)）。
+GemPT 让 Gemini 通过本机 [Magpie](https://github.com/yetone/magpie) 咨询 GPT、委派 Codex 仓库任务，并在 **GemPT** 侧栏实时查看和介入运行。Magpie 插件、Antigravity stdio MCP、hooks、安装器和 CLI 共用一套 Node.js ESM 核心；运行时零第三方依赖（仅用 Node.js 内置模块），GemPT 随包提供预构建资源与完整第三方开源许可（[THIRD_PARTY_LICENSES.txt](./THIRD_PARTY_LICENSES.txt)）。
 
 ## 前置依赖与版本要求
 
@@ -10,7 +10,7 @@ GemPT 让 Gemini 通过本机 [Magpie](https://github.com/yetone/magpie) 咨询 
 | --- | --- | --- |
 | **Node.js** | `>= 20.11.0` | 运行 MCP server、hooks、CLI 与安装器 |
 | **Magpie** | `>= 0.1.1340` | 本地网关（默认 `http://127.0.0.1:3425`），从 [yetone/magpie](https://github.com/yetone/magpie) / [usemagpie.ai](https://usemagpie.ai) 安装并登录 ChatGPT/Codex 订阅 |
-| **Magpie 侧 GemPT 插件** | `0.4.1` | 提供 `Plugins → GemPT` 面板，并托管共享 Codex `app-server`（Windows 跨 Magpie 热重载独立存活，支持面板一键重启）；**仅单独安装 Codex CLI 无法替代** |
+| **Magpie 侧 GemPT 插件** | `0.6.0` | 提供 `Plugins → GemPT` 面板，并托管共享 Codex `app-server`（Windows 跨 Magpie 热重载独立存活，支持面板一键重启）；**仅单独安装 Codex CLI 无法替代** |
 | **Codex CLI** | `@openai/codex`（已实测 `0.164.0`） | 仅 `gpt_run` 仓库执行需要；通过 `npm install -g @openai/codex` 安装（纯 `gpt_ask` 咨询可不装） |
 | **Git** | 任意现代版本 | 仅并发隔离 `workspace="share"` 需要 |
 
@@ -22,11 +22,11 @@ GemPT 让 Gemini 通过本机 [Magpie](https://github.com/yetone/magpie) 咨询 
 
 ### 2. 安装 Magpie 侧插件
 
-直接在 Magpie 插件市场中搜索 **GemPT** 安装（官方市场已收录 `v0.4.1`，走 GitHub 通道 `github:yizhang-dream/gempt`），或在终端运行：
+直接在 Magpie 插件市场中搜索 **GemPT** 安装，或在终端运行：
 
 ```bash
-# 推荐：从 GitHub tag 安装（当前立即可用）
-magpie plugin add github:yizhang-dream/gempt#v0.4.1
+# 推荐：从 GitHub tag 安装
+magpie plugin add github:yizhang-dream/gempt#v0.6.0
 ```
 
 > 注：`gempt` 尚未发布到 npm registry，请勿直接运行裸包名命令 `magpie plugin add gempt`（当前会返回 404）。
@@ -38,11 +38,11 @@ magpie plugin add github:yizhang-dream/gempt#v0.4.1
 ### 3. 安装 Antigravity 侧插件
 
 ```bash
-# 推荐：通过 GitHub tag 一键安装（当前立即可用）
-npx --yes github:yizhang-dream/gempt#v0.4.1 install-agy
+# 推荐：通过 GitHub tag 一键安装
+npx --yes github:yizhang-dream/gempt#v0.6.0 install-agy
 ```
 
-> 注：`gempt` 尚未发布到 npm registry，请使用上述 GitHub tag 渠道或从本地源码安装（裸 npm 命令 `npx --yes gempt@0.4.1 install-agy` 尚未生效）。
+> 注：`gempt` 尚未发布到 npm registry，请使用上述 GitHub tag 渠道或从本地源码安装（裸 npm 命令 `npx --yes gempt@0.6.0 install-agy` 尚未生效）。
 
 从本地源码安装时：
 - **Linux / macOS**：`bash install.sh`（支持 `--target <目录>`）
@@ -76,11 +76,13 @@ gempt init --non-interactive
 | --- | --- | --- |
 | `gpt_run` | `gempt_run` | 异步 Codex 仓库任务。传 `goal`、`cwd`，用 `access="inspect"` 只读调查或 `access="change"` 改代码。多路并发改同一 Git 仓库时传 `access="change"` + `workspace="share"`（基于已提交 `HEAD` 建独立 worktree；只读 `inspect` 禁止使用 `share`）。 |
 | `gpt_ask` | `gempt_ask` | 同步咨询。传 `goal`，可选 `cwd`、`file_paths` 与 `session_id`。整理日志或摘要时传 `tier="chore"`。 |
-| `gpt_ctl` | `gempt_ctl` | 状态查询、转向、中止或回复 `ask_gemini`（`action="status"|"steer"|"interrupt"|"reply"`）。在 Antigravity 调用 `gpt_ctl({})` 打开 **GemPT Live** 侧栏。 |
+| `gpt_ctl` | `gempt_ctl` | 状态查询、转向、中止或回复 `ask_gemini`（`action="status"|"steer"|"interrupt"|"reply"`）。在 Antigravity 打开 [GemPT](sidecar://gempt/gempt_live/) 侧栏，可切换至概览（含设置）、请求或会话。 |
 
 `gpt_run` 返回 `run_id`、`session_id` 和 `wait_command`。请优先原样通过 `run_command(WaitMsBeforeAsync=500)` 后台执行返回的 `wait_command` 等待系统唤醒（终端手动等待可用 `gempt-wait <run_id>`、`gempt-wait id1,id2` 或 `gempt-wait --all id1,id2`）。续聊传 `session_id`；失败返工省略 `session_id` 开新线程。
 
 新线程按 Antigravity 当前的 Gemini 家族配对，已知家族也可用 `gemini_family` 传入。回执用 `paired:<family>` 标识配对，用 `mcp` 标识未识别家族时走默认模型。旧脚本显式传入 `tier` 时仍按指定档位路由。
+
+点击顶栏 **中 / EN** 可立即切换语言。打开 **概览 → 连接与高级设置** 可跟随浏览器语言、配置本地或远程 Magpie 网关、测试尚未保存的连接、调整模型与 Codex 选项，以及恢复默认设置。恢复默认时会默认保留当前网关。远程网关可使用保存的 API 密钥。若需从环境变量取密钥，请在 GemPT 进程环境中将 `GEMPT_TRUSTED_GATEWAY` 设为该网关的 Base URL。
 
 ## 控制面板的两种用法
 
@@ -108,7 +110,7 @@ gempt print-mcp --installed
 - **工作区边界**：Antigravity stdio `gpt_run` 默认 `access="change"` 并沿用配置的 Codex 沙箱（推荐 `workspace-write`）。建议在外部/敏感环境中配置环境变量 `GEMPT_WORKSPACE_ROOT` 限定允许访问的根目录。
 - **只读与 Worktree 隔离**：`access="inspect"` 严格禁止搭配 `workspace="share"`；`workspace="share"` 从已提交的 `HEAD` 检出（工作区未提交改动不会自动带入），创建时禁用目标仓库 Git hooks，并校验 worktree 归属。
 - **回环鉴权**：Magpie 控制面板仅监听 `127.0.0.1:3498`，校验 Host/Origin、`x-gempt-key` 及本机身份文件；共享 Codex `app-server` 仅监听回环并启用 capability-token 认证。
-- **Live 会话隔离**：GemPT Live 默认按当前绑定的宿主会话过滤（`scope="session"`），未绑定时默认不跨会话泄露历史运行，需显式切到 `scope="all"` 查看全部。
+- **Live 会话隔离**：GemPT 默认按当前绑定的宿主会话过滤（`scope="session"`），未绑定时默认不跨会话泄露历史运行，需显式切到 `scope="all"` 查看全部。
 
 ## 升级与卸载
 
