@@ -45,6 +45,15 @@
 >
 > 三类 Agent 的每一步 7 类 Token 构成均按该步真实上下文计算（轮内逐步增长，非整轮共用快照），并以该步真实 prompt 为总量归一，堆叠柱与「实际 Token」始终对齐。
 
+#### 跨平台支持
+
+macOS / Linux / Windows 均可运行，CI 在三个平台 × Node 22/24 上验证。Windows 上需要注意两点，都已自动处理：
+
+- **主目录**：Windows 没有 `HOME` 环境变量。插件按 `HOME` → `USERPROFILE` → `os.homedir()` 依次解析；如果三者都不可用，`sync` 会**拒绝写入**并报错退出，不会用一份空索引覆盖你已有的数据。
+- **解压**：DSH 的会话是 zstd 压缩的。插件用 Node 内置的 `zlib.zstdDecompressSync`（Node ≥ 22.15）直接解压，**不依赖 `zstd` / `grep` 命令行工具**。
+
+`magpie-context doctor` 会打印它实际解析到的主目录和每个数据源的存在性，排查"为什么没有数据"时先跑它。
+
 ---
 
 ## 📦 安装方式
