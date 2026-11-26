@@ -1,142 +1,115 @@
 # magpie-agent-lingxi
 
-WPS 灵犀 (Lingxi) on magpie's **Agents** page. magpie's models appear in 灵犀's
-「自定义模型」 menu as `magpie/<model>`, served through magpie's gateway and
-routing groups.
+WPS 灵犀 (Lingxi) on magpie. magpie's models appear in 灵犀's 「自定义模型」 as
+`magpie/<model>`, served through magpie's gateway and routing groups.
 
 > **Unofficial.** Not affiliated with Kingsoft / WPS. Windows only.
 
 ## What it does
 
-- Adds **WPS 灵犀** to magpie's Agents page, so you can pick one of magpie's
-  models for it.
-- A small detached daemon syncs magpie's model list into 灵犀's own
-  custom-model storage over the Chrome DevTools Protocol. 灵犀 keeps that list
-  in its renderer's localStorage, so CDP is the only way in, and CDP only
-  exists when 灵犀 starts with `--remote-debugging-port`; when the port is
-  missing and there is something to sync, the daemon restarts 灵犀 with it
-  itself. Turning the agent on in magpie is the whole setup.
-- A local proxy on `127.0.0.1` keeps the display name `magpie/<model>` while
-  forwarding `<model>` to magpie (the gateway does not accept the prefix).
+- A local proxy on `127.0.0.1` (3426, or the next free port) forwards
+  `magpie/<model>` to magpie with the model's own name, so 灵犀's traffic keeps
+  working across magpie's routing and model changes.
+- The plugin's page (**插件 → WPS 灵犀**) has a **同步** button. Pressing it
+  writes magpie's model list into 灵犀's own custom-model list.
 - Models from the `wps-lingxi/*` provider are excluded, so 灵犀 does not call
   itself through magpie (which would loop and spend credits twice).
+
+## How the sync works, and what it touches
+
+灵犀 keeps its custom models in its **page's localStorage** — there is no
+config file and no import for them. The only way to write them is the Chrome
+DevTools Protocol, and CDP only exists in a 灵犀 started with
+`--remote-debugging-port`. A sync is therefore:
+
+1. Press **同步**, then confirm.
+2. The plugin asks 灵犀's windows to close (WM_CLOSE, as 灵犀's own Quit does).
+   **It never force-kills 灵犀.** If a window stays (it is asking something) or
+   灵犀 stays in the tray, the sync stops and says so — quit 灵犀 yourself, then
+   press 同步 again.
+3. It starts 灵犀 once with `--remote-debugging-port`, writes the list, and
+   refreshes the page (the open conversation is kept).
+4. It closes 灵犀 again and starts it the way you normally start it — its
+   Run / sign-in entry when it has one (a checkbox on the page turns that
+   off), else a plain start. **The debug port is gone.**
+
+The plugin never edits shortcuts or Run entries. After a successful sync the
+model list is in 灵犀's own storage; 灵犀 started normally uses it.
+
+## What a sync is needed for
+
+- The **proxy** keeps `magpie/<model>` working through magpie's routing, so
+  conversation works whenever magpie is running — 灵犀 can be started normally.
+- A sync is needed when the **set** of models changes (a provider added or
+  removed, a model list edited in magpie). Press 同步 again: one close and
+  reopen. Switching which model you use in magpie does not need one.
+
+## Lifetime
+
+The proxy and the sync run **inside magpie's plugin host**. Turning the plugin
+off, updating it, or quitting magpie ends them. Nothing the plugin starts
+outlives magpie.
+
+## Upgrade from 0.1.x on Windows
+
+0.1.x added `--remote-debugging-port=9222` to the Lingxi shortcuts and Run
+value it found and kept their original arguments in
+`%USERPROFILE%\.config\magpie\lingxi-agent\shortcuts.json`. 0.2.0 does not
+use them. To put them back:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\restore-local.ps1          # what it would change
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\restore-local.ps1 -Apply   # change it
+```
+
+A Lingxi that is running with the port (started before the restore) keeps it
+until it is quit and started again.
 
 ## Requirements
 
 - Windows 10/11.
 - magpie with agent-plugin support (0.1.x).
-- WPS 灵犀 installed. It is detected from the Windows uninstall registry or
-  common install paths; `LINGXI_EXE` / `LINGXI_HOME` override the detection.
-- No Node install is needed: magpie's Bun runs the daemon.
+- WPS 灵犀 installed. It is found from the Windows uninstall registry or common
+  install paths; `LINGXI_EXE` / `LINGXI_HOME` override that.
+- No Node install: magpie's Bun runs it.
 
 ## Install
 
 - From magpie → 插件 → 发现: search `magpie-agent-lingxi` and install.
 - Or: `magpie plugin add github:dongv88/magpie-agent-lingxi`
-- Or local: `magpie plugin add C:\path\to\magpie-agent-lingxi`
-
-After installing, if **WPS 灵犀** does not appear on the Agents page, restart
-magpie once: the plugin creates its detection marker on first run.
 
 ## Use
 
-1. In magpie: **Agent → WPS 灵犀 → switch it on, pick a model**.
-2. That is all. In 灵犀: **选择其他模型 → 自定义模型 → `magpie/<model>`**.
-
-The debug port can only be passed when 灵犀 starts. The plugin therefore adds
-`--remote-debugging-port=9222` to the shortcuts that start 灵犀 (desktop, Start
-menu, taskbar, startup folder and the Run key), so a normal start opens the port
-and nothing else is needed. A start entry it cannot write (the public desktop
-shortcut needs admin rights) leaves 灵犀 without the port; the plugin then closes
-and reopens it **once** at that moment — WM_CLOSE first, and `taskkill` when the
-tray keeps it open (灵犀 restores the conversation). After the sync the list is
-in 灵犀's own storage, and picking a model in magpie again only rewrites it,
-with no restart while 灵犀 already runs with the port.
-
-`launch-lingxi.cmd` still starts 灵犀 with the port by hand.
-`LINGXI_NO_RESTART=1` turns the restart off, `LINGXI_NO_FORCE_RESTART=1` only
-keeps it from ending a tray 灵犀 that ignores WM_CLOSE, and
-`LINGXI_NO_SHORTCUT=1` leaves the shortcuts alone; with those, 灵犀 is left
-alone and the models are synced the next time it happens to run with the port.
-
-The debug port is needed **for syncing only**. The local proxy keeps working
-without it, and `launch-lingxi.cmd` reopens 灵犀 with the port whenever you want
-to refresh the list by hand.
-
-## Enable / disable
-
-- magpie → 插件 → `magpie-agent-lingxi` → toggle.
-- CLI (use the folder path the plugin was installed from):
-
-```bat
-magpie plugin off C:\path\to\magpie-agent-lingxi
-magpie plugin on  C:\path\to\magpie-agent-lingxi
-```
-
-Turning it off disconnects the agent. The daemon notices the switch in
-`~/.config/magpie/plugins.json` within about 15 seconds, removes the `magpie/*`
-entries from 灵犀, restores the model 灵犀 had before, and exits. Turning it on
-again requires reconnecting the agent (Agent page) or
-`magpie lingxi deepseek/deepseek-flash`.
-
-The daemon stays up while magpie runs, not just for the moment the plugin host
-happens to be alive: the plugin host is recycled right after magpie loads it, and
-the `magpie/*` entries in 灵犀 point at this daemon's proxy, so a daemon that
-quits early takes the models with it. It exits on its own only when the plugin is
-off or removed, or when the magpie gateway has been unreachable for 10 minutes.
+1. In magpie: **Agent → WPS 灵犀 → switch it on, pick a model.** This writes
+   the model to `~/.config/magpie/lingxi.json`.
+2. Open **插件 → WPS 灵犀**, press **同步** (the first time; and again whenever
+   the model list changes).
+3. In 灵犀: **选择其他模型 → 自定义模型 → `magpie/<model>`**.
 
 ## Data and privacy
 
-- Data dir: `%USERPROFILE%\.config\magpie\lingxi-agent`
-  (`daemon.log`, `host.log`, `heartbeat`, `daemon.lock`, `install.json`,
-  `installed/` marker, `shortcuts.json` holding the original shortcut
-  arguments the plugin appended the debug port to).
-- The proxy listens on `127.0.0.1:3426` (falls back to 3427-3435).
-- The plugin writes only 灵犀's `claw_custom_model_configs` and
-  `cowork_model_option_v2` in its own storage.
-- It does **not** read or store your WPS credentials. Requests use magpie's
-  per-agent gateway key (`magpie-lingxi`).
-- While 灵犀 is open with the debug port, a local process can control its
-  renderer. Close 灵犀 or restart it normally when you are not syncing if that
-  matters to you.
+- The proxy and the sync listen on `127.0.0.1` only.
+- The page writes only 灵犀's `claw_custom_model_configs` (the custom-model
+  list) and its selected model (`cowork_model_option_v2`).
+- It does **not** read or store your WPS credentials or conversation. Requests
+  carry magpie's per-agent gateway key (`~/.config/magpie/lingxi.json`), the
+  same one magpie writes for this agent.
+- While 灵犀 runs with the debug port (only during a sync), any local process
+  could control its renderer; that window is a few seconds per sync.
+- State files: `%USERPROFILE%\.config\magpie\lingxi-agent` (`install.json`,
+  `settings.json`, `host.log`).
 
 ## Troubleshooting
 
 - **Agent missing**: restart magpie once; check that 灵犀 is installed.
-- **Models missing in 灵犀**: 灵犀 must run with `--remote-debugging-port=9222`
-  for a sync; check `daemon.log`. Since 0.1.3 the log says so directly:
-  `Lingxi has no page on CDP port 9222 (...)`. Earlier versions reported the
-  same condition as a bare `ECONNREFUSED`, which reads like the magpie gateway
-  is down even though it is not.
-- **灵犀 closed and reopened by itself**: that is the sync giving it the debug
-  port, from a start entry the plugin could not write the argument to (the
-  public desktop shortcut needs admin rights). `daemon.log` says
-  `gave the debug port to … Lingxi shortcut(s)` and
-  `restarting Lingxi with --remote-debugging-port=9222 to sync (pid …)`. While
-  the log says `Lingxi stayed open after WM_CLOSE`, the tray icon held it and
-  it was ended to reopen with the port.
-- **Plugin is on but nothing ever syncs**: the plugin host only runs when magpie
-  loads it, so switching the plugin on (or picking a model on the Agent page)
-  does not by itself perform a sync while 灵犀 is already running without the
-  debug port. Start 灵犀 with `launch-lingxi.cmd` first, then toggle the plugin
-  off/on (or `magpie lingxi <model>`) to give the daemon a chance to sync.
-- **Models show but fail**: check the proxy port in `daemon.log` and that the
-  magpie gateway is at `127.0.0.1:3425`.
-- **After a 灵犀 update**: the app may restart without the debug port; run
-  `launch-lingxi.cmd` again.
-- **Nothing starts after a magpie restart**: `host.log` used to show
-  `spawn via wmi status=null err=Executable not found in $PATH: "powershell.exe"`
-  because the plugin host does not always get System32\WindowsPowerShell on its
-  PATH. The host resolves `powershell.exe` by absolute path now, and falls back
-  to starting the daemon with Bun itself (logged as
-  `started the daemon with bun directly`) when that is not possible either.
-- **A command window on every magpie start**: fixed in 0.1.1. The daemon used to
-  be created by WMI as a console program, which got a visible console window
-  for as long as it ran. It is now created through `spawn-daemon.vbs`
-  (`wscript.exe`, a GUI program with no console), which starts Bun with its
-  window hidden. On an older version, run `magpie plugin update`. If a window
-  still shows, `spawn-error.log` in the data dir says whether the launcher was
-  skipped and the direct spawn used (Windows Script Host disabled, for example).
+- **“Lingxi closed its window but is still in the tray”**: right-click the tray
+  icon → Quit, then 同步 again.
+- **“still running. It may be asking something in its window”**: answer 灵犀's
+  dialog (Save?), then 同步 again.
+- **Models show but fail**: magpie must be running (the proxy is what serves
+  them). `host.log` tells the proxy's port.
+- **After a 灵犀 update**: 灵犀 may drop its storage; 同步 again.
+- **Nothing syncs**: check `~/.config/magpie/lingxi-agent/host.log`.
 
 ## Disclaimer
 
